@@ -1,0 +1,353 @@
+# devd — Design Specification
+
+## Problem
+
+Development environments are heavy, slow, and machine-bound. On macOS, every container solution (Docker Desktop, Podman, Lima, Colima) follows the same pattern: run a persistent Linux VM, then run containers inside it. This means double-layered virtualization, gigabytes of background RAM usage, and shared-kernel isolation between workspaces.
+
+Moving work between machines means rebuilding state from scratch. There is no standard way to snapshot a development environment and restore it elsewhere.
+
+## Core Insight
+
+Use microVMs directly — one per workspace — instead of running containers inside a hidden VM. Separate orchestration (devd) from environment definition (devenv/devcontainer). Enable cold migration via filesystem snapshots.
+
+---
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────┐
+│  devd CLI + daemon (Go binary)               │
+│  ────────────────────────────────────────    │
+│  • Shell out to krunvm/crun (VM lifecycle)   │
+│  • SSH config + CA manager                   │
+│  • Port proxy (contested ports)              │
+│  • SQLite (workspace metadata)               │
+│  • S3 client (v0.3+)                         │
+└───────┬──────────────────────────────────────┘
+        │
+        ├── manages ──► SQLite (~/.devd/devd.db)
+        │
+        ├── shells out ──► krunvm / crun
+        │                    │
+        │               ┌────┴─────┐
+        │               │  microVM │ ×N (one per workspace)
+        │               │  ──────  │
+        │               │  sshd    │◄── SSH tunnels (port relay)
+        │               │  server  │    + IDE integration
+        │               │  :8080   │
+        │               └──────────┘
+        │
+        └── pre-empts ──► 0.0.0.0:<contested ports>
+                          (blocks TSI, proxies to active VM)
+```
+
+devd shells out to krunvm/crun for VM lifecycle. On macOS, libkrun uses Apple's Hypervisor.framework. On Linux, it uses KVM. There is no intermediate VM layer. Each workspace is a first-class microVM on the host.
+
+**Networking** uses libkrun's TSI (Transparent Socket Impersonation). Ports bound inside a VM are auto-exposed on the host. For contested ports (multiple workspaces claiming the same port), devd pre-empts them on the host before VMs start. This causes TSI to fall back to real kernel sockets in the guest — preserving loopback — while a host-side proxy routes external traffic to the active workspace via SSH tunnels.
+
+---
+
+## Component Stack
+
+| Layer | Component | Role |
+|-------|-----------|------|
+| CLI | [cobra](https://github.com/spf13/cobra) | Command parsing |
+| VM runtime | krunvm / crun (shelled out) | MicroVM lifecycle. No CGO. |
+| Filesystem | virtio-fs (built into libkrun) | Host ↔ VM code mount at `/workspace` |
+| Networking | libkrun TSI | Transparent socket proxying via vsock |
+| Port proxy | devd daemon (Go, host-side) | Pre-empts contested ports, proxies via SSH tunnels |
+| SSH | devd CA + per-VM certificates | IDE integration, SSH tunnels, `~/.ssh/config` management |
+| State | [modernc.org/sqlite](https://pkg.go.dev/modernc.org/sqlite) | Workspace metadata, pure Go, no CGO |
+| Base image | Alpine OCI + [Nix](https://nixos.org) | Default ~50MB base, pulled from registry. User can bring any OCI image. |
+| IDE integration | SSH | VS Code Remote-SSH, Cursor, any SSH-capable editor |
+| Env config | [devenv](https://devenv.sh) / devcontainer.json (subset) | User-defined environment |
+
+---
+
+## Key Design Decisions
+
+### Direct microVM, not container-in-VM
+
+On macOS, Docker Desktop and Podman both run a persistent Linux VM and execute containers inside it. This is because containers depend on Linux kernel primitives (namespaces, cgroups) that macOS does not provide.
+
+libkrun sidesteps this by creating microVMs that boot their own Linux kernel directly on the host hypervisor. Each workspace gets its own kernel, its own userspace, and full isolation — without an intermediate VM layer.
+
+Trade-off: we lose Docker API compatibility and the VS Code Dev Containers plugin. We gain single-layer virtualization, per-workspace kernel isolation, zero background overhead, and sub-second boot times.
+
+### SSH for IDE integration, not Docker API
+
+The VS Code Dev Containers extension requires a Docker-compatible socket. Implementing a Docker API shim is significant engineering for marginal benefit. Instead, devd runs sshd inside each microVM and manages `~/.ssh/config` entries automatically.
+
+VS Code Remote-SSH is more mature, works with every editor (Cursor, JetBrains Gateway, Neovim + ssh), and doesn't couple us to Docker's API surface. Port forwarding, terminal access, and extension installation all work over SSH.
+
+### devd CA for SSH key management
+
+devd generates a CA key pair on first run (`~/.devd/ca`). Each workspace gets a host certificate signed by the CA. The user's `~/.ssh/config` is configured to trust the devd CA, so connecting to any workspace just works — no manual key acceptance, no known_hosts conflicts when VMs are recreated.
+
+### Shell out, not CGO
+
+devd shells out to krunvm/crun for VM operations rather than linking libkrun's C API via CGO. This keeps the Go binary simple and cross-compilable. krunvm is a required dependency.
+
+### Image-agnostic, registry-hosted default
+
+devd does not manage or build images. It pulls OCI images and boots them. A default image (Alpine + Nix, ~50MB) is hosted on a registry and pulled on first use. Users can bring any OCI image.
+
+### Cold migration only
+
+Live migration adds enormous complexity for dev workloads that don't need it. Snapshot the filesystem, upload, restore elsewhere. The workspace identity (name, config, port mappings) travels as a JSON sidecar alongside the tarball.
+
+---
+
+## Networking
+
+### How TSI Works
+
+TSI (Transparent Socket Impersonation) is libkrun's networking layer. The custom libkrunfw kernel intercepts AF_INET socket syscalls inside the guest, converts them to AF_VSOCK messages, and the VMM process on the host proxies them as real AF_INET sockets.
+
+Key behaviors (empirically verified, see `experiments/`):
+
+| Behavior | Details |
+|----------|---------|
+| **Auto-expose** | Guest `bind(0.0.0.0:8080)` → VMM binds `0.0.0.0:8080` on host. Zero config. |
+| **Guest loopback** | `curl localhost:8080` inside the VM reaches the VM's own server (when no host contention). |
+| **Pre-emption** | If host already holds `0.0.0.0:X` (no `SO_REUSEPORT`), TSI's bind fails silently. Guest `bind()` still succeeds — guest kernel falls back to real socket handling. Loopback is truly local. `ss -tlnp` shows real listeners. |
+| **Multi-VM coexistence** | Multiple VMs can bind the same port. Kernel routes to one; survivors take over when others release. |
+| **No port maps** | `krun_set_port_map` breaks guest loopback. devd must not use it. |
+
+### Port Pre-emption and the Proxy Architecture
+
+When a user declares contested ports (ports used by multiple workspaces), devd pre-empts them:
+
+1. **Before VMs start**, the devd daemon binds `0.0.0.0:<contested-port>` on the host (without `SO_REUSEPORT`).
+2. **TSI's host-side bind fails** for those ports. The guest falls back to real kernel sockets.
+3. **Guest loopback works** — truly local, not proxied through TSI. `curl localhost:8080` inside any VM hits that VM's own server.
+4. **The daemon owns the port** on the host. External traffic (browser, curl from host) goes to the daemon.
+5. **SSH tunnels** relay traffic from the daemon to the active VM. Each VM runs sshd on a unique port (assigned by devd, exposed by TSI). The daemon creates `ssh -L` tunnels from host-side relay ports to each VM's `localhost:<contested-port>`.
+6. **Switching** = change which tunnel the daemon routes to.
+
+Non-contested ports (used by only one workspace) are auto-exposed by TSI with no proxy involvement.
+
+```
+                    ┌─────────────┐
+  browser/curl ───► │ devd daemon │
+                    │ 0.0.0.0:8080│
+                    └──────┬──────┘
+                           │ proxy to active VM's relay
+                    ┌──────┴──────┐
+                    ▼             ▼
+           SSH tunnel:9001  SSH tunnel:9002
+           (host-side)      (host-side)
+                │                │
+                │ ssh -L         │ ssh -L
+                ▼                ▼
+          VM-A :2222       VM-B :2223
+          (sshd via TSI)   (sshd via TSI)
+                │                │
+                ▼                ▼
+          VM-A localhost   VM-B localhost
+          :8080 (local)    :8080 (local)
+          loopback ✓       loopback ✓
+```
+
+### devd switch
+
+```
+$ devd switch frontend
+
+1. devd identifies contested ports between current active workspace and target
+   → e.g., both claim :8080
+
+2. Daemon changes proxy target from backend's relay port to frontend's relay port
+   → host:8080 now routes to frontend
+
+3. Both VMs keep running. No server processes killed. No guest-side changes.
+   Guest loopback works in both VMs throughout.
+```
+
+**Properties:**
+- **Zero disruption.** Nothing is killed or restarted inside any VM.
+- **Instant (~20ms).** Change the proxy target; next connection goes to the new VM.
+- **Fully reversible.** A→B→A→B switching is clean with no state corruption.
+- **All VMs independently reachable.** Even while the proxy routes to one VM, others are reachable via their relay ports or SSH.
+
+### Platform Differences
+
+| Aspect | macOS | Linux |
+|--------|-------|-------|
+| Hypervisor | Hypervisor.framework | KVM |
+| VM runtime | libkrun (via krunvm) | libkrun (via crun) |
+| Networking | TSI | TSI (or pasta — has real netns, loopback works unconditionally) |
+| Port proxy | Same on both | Same on both |
+
+---
+
+## Environment Configuration
+
+Two paths. devd orchestrates the VM; the user configures what's inside.
+
+**devenv** (primary): User has `devenv.nix` in their project. Inside the VM, `devenv up` starts services via process-compose.
+
+**devcontainer.json** (compatibility, subset):
+
+| Field | Behavior |
+|-------|----------|
+| `postCreateCommand` | Run after first workspace creation |
+| `forwardPorts` | Added to workspace's reserved ports |
+| `dotfiles.repository` | `git clone` + `install.sh` on create |
+| `customizations` | Shell config, editor settings |
+
+The `image` field is respected as the base OCI image for the workspace. Full devcontainer spec features (Docker Compose, lifecycle hooks, features) are out of scope.
+
+---
+
+## State: SQLite
+
+SQLite tracks workspace metadata that doesn't live anywhere else. It is an index, not a source of truth — krunvm/crun owns VM state.
+
+```sql
+CREATE TABLE workspaces (
+    name          TEXT PRIMARY KEY,
+    image         TEXT NOT NULL,
+    rootfs_path   TEXT NOT NULL,
+    ssh_port      INTEGER NOT NULL UNIQUE,   -- unique sshd port per VM
+    relay_port    INTEGER NOT NULL UNIQUE,    -- host-side SSH tunnel relay port
+    state         TEXT DEFAULT 'stopped',     -- stopped | running
+    is_active     BOOLEAN DEFAULT FALSE,      -- receives traffic on contested ports
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE reserved_ports (
+    workspace  TEXT REFERENCES workspaces(name),
+    port       INTEGER NOT NULL,
+    PRIMARY KEY (workspace, port)
+);
+
+-- v0.2+
+CREATE TABLE snapshots (
+    workspace   TEXT REFERENCES workspaces(name),
+    path        TEXT NOT NULL,
+    metadata    TEXT,               -- JSON: workspace config sidecar
+    size_bytes  INTEGER,
+    created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+Reserved ports are declared in the workspace config (via `forwardPorts` in devcontainer.json, or devd CLI flags). Ports claimed by multiple running workspaces are contested — devd pre-empts them and proxies via SSH tunnels.
+
+---
+
+## Phasing
+
+| Version | Scope | Success Criteria |
+|---------|-------|------------------|
+| **v0.1** | Local lifecycle + switch | `devd new myapp && devd shell myapp` works. sshd running. VS Code Remote-SSH connects. File mount bidirectional. `devd switch` routes contested ports via proxy. |
+| **v0.2** | Snapshots | `devd snapshot myapp` produces tarball + JSON sidecar. `devd restore` recreates workspace from snapshot. |
+| **v0.3** | Remote storage | `devd snapshot --to s3://...` works. Restore on a fresh machine from S3. |
+| **v0.4** | Remote nodes | `devd new --remote <server>`. Server runs devd in agent mode. SSH/mTLS control plane. |
+| **v0.5** | Migration | `devd move myapp --to <server>`. Snapshot → upload → restore. |
+| **v0.6+** | Polish | VS Code/Cursor extension for one-click connect. devenv.yaml generation. OCI image export. |
+
+### v0.1 Scope Boundaries
+
+**In scope**: Workspace lifecycle (new/shell/list/stop/rm), `devd switch` via proxy-based port routing, microVM per workspace, host code mount, SSH access (devd CA), devcontainer.json subset, base image selection.
+
+**Out of scope**: Remote nodes, live migration, full devcontainer spec, IDE plugins, image building, dynamic port detection.
+
+---
+
+## Why Not X?
+
+### Docker Desktop
+
+Runs a LinuxKit VM (~2-4GB RAM) permanently. All containers share that VM and its kernel. No per-workspace isolation. No snapshot/migration. Proprietary license for enterprise. devd replaces the VM-in-VM architecture with direct microVMs.
+
+### Podman
+
+Better than Docker Desktop (daemonless, rootless, libkrun machine provider on Mac). But on macOS, `podman machine` still runs a Fedora CoreOS VM, and all containers execute inside it. Using `--runtime krun` for individual containers means microVMs inside a VM — double nesting. devd eliminates the outer VM.
+
+### Dev Containers (spec)
+
+The devcontainer spec assumes Docker/Podman as the runtime. The VS Code plugin uses `docker exec` for communication. Supporting the full spec requires implementing a Docker API shim. devd supports the useful subset (postCreateCommand, forwardPorts, dotfiles) and uses SSH instead of Docker for IDE integration.
+
+### Apple Containerization (macOS 26+)
+
+Apple's new `container` tool runs each container in its own lightweight VM — architecturally similar to devd. However, it's Swift-only, macOS-only (requires macOS 26 Tahoe), and has no snapshot/migration story. devd works on both macOS and Linux using the same codebase, and is designed for workspace mobility from day one.
+
+### Lima / Colima
+
+Convenience wrappers around QEMU or Virtualization.framework. Still a single VM that hosts containers. Same double-layer problem.
+
+---
+
+## Open Questions
+
+1. **libkrun pause/resume**: libkrun currently has no pause/suspend API. If upstream adds this, it could complement the proxy switch by reducing idle VM resource usage.
+2. **Proxy daemon lifecycle**: Should the daemon be a long-running background process, or started/stopped with workspace commands? Long-running is simpler for port holding but adds a background process.
+3. **pasta on Linux**: pasta provides a real network namespace — guest loopback works unconditionally and port detection is built in. Should Linux use pasta instead of TSI? Proxy architecture still works either way.
+
+---
+
+## Appendix: TSI Internals
+
+For contributors working on the networking layer. Based on libkrun source analysis and six rounds of empirical testing. See `experiments/` for scripts and detailed results.
+
+### How TSI intercepts sockets
+
+TSI operates at the guest kernel level via a custom kernel module in libkrunfw. When a guest process calls `socket()`, `bind()`, `connect()`, `listen()`, or `accept()` on AF_INET sockets, the kernel module intercepts these and communicates with the VMM via virtio-vsock control messages.
+
+Key data structures (from libkrun `src/devices/src/virtio/vsock/`):
+
+- `TsiConnectReq { peer_port, addr, port }` — guest initiates outbound connection
+- `TsiListenReq { peer_port, addr, port, vm_port, backlog }` — guest calls bind+listen
+- `TsiAcceptReq` — guest polls for incoming connections
+- Host port map: `Option<HashMap<u16, u16>>` — if `Some`, only mapped ports can bind; unmapped returns `EPERM`. If `None`, transparent 1:1 binding.
+
+### Port map behavior
+
+```rust
+// From tcp.rs try_listen()
+let port = if let Some(port_map) = host_port_map {
+    if let Some(port) = port_map.get(&req.port) {
+        *port           // remap to host port
+    } else {
+        return -EPERM;  // deny: port not in map
+    }
+} else {
+    req.port            // transparent: same port on host
+};
+// Then: bind(host, 0.0.0.0, port)
+```
+
+devd MUST NOT set a port map. Doing so breaks guest loopback and restricts which ports can bind inside the guest.
+
+### Guest loopback — two modes
+
+**Normal (TSI active):** Guest `connect(127.0.0.1:X)` is proxied by TSI to the host, where it connects to `127.0.0.1:X` — which resolves to the same VM's `*:X` listener. Loopback works but is indirect. `ss -tlnp` shows nothing because TSI intercepts below the kernel socket table.
+
+**Fallback (TSI host-side bind fails):** When the host already holds `0.0.0.0:X` (without `SO_REUSEPORT`), TSI's `bind(0.0.0.0:X)` on the host fails. The guest's `bind()` still returns success, but the guest kernel falls back to real socket handling. `ss -tlnp` shows the listener. Guest loopback is truly local — not proxied through TSI.
+
+This fallback is the foundation of devd's proxy architecture.
+
+### Full empirical behavior table
+
+Verified on macOS ARM64, krunvm 0.2.6, Feb 2026. Six rounds of testing across Experiments 1–6.
+
+| Scenario | Result |
+|----------|--------|
+| Guest binds `:8080`, no contention | VMM binds `0.0.0.0:8080` on host. Auto-exposed. |
+| Guest `curl localhost:8080` (no contention) | Works. TSI routes to own server. |
+| Host holds `0.0.0.0:8080` (no `SO_REUSEPORT`) before VM | TSI host-side bind blocked. Guest falls back to real sockets. |
+| Guest `bind()` after `0.0.0.0` pre-emption | Succeeds (`strace`: `bind() = 0`). |
+| Guest loopback after pre-emption | Works — truly local. `ss -tlnp` shows real listener. |
+| Host curl after pre-emption | Hits host daemon only (10/10). |
+| SSH tunnel relay (proxy → `ssh -L` → VM) | Works end-to-end. |
+| Two-VM proxy switch | Instant (~20ms). Fully reversible. Both VMs have loopback. |
+| Host holds `127.0.0.1:8080`, TSI holds `0.0.0.0:8080` | Coexist. Host shadows TSI for localhost callers. Guest loopback breaks. |
+| Host uses `SO_REUSEPORT` on `0.0.0.0:8080` | TSI coexists — connections distributed unpredictably. Don't use. |
+| Two VMs both bind `:8080` (no pre-emption) | Both succeed. First-to-bind wins deterministically. |
+| Kill one VM | Surviving VM takes over (~25ms). |
+| SIGSTOP on krunvm process | No failover. Connections queue and timeout. |
+| `krun_set_port_map` | Breaks guest loopback. |
+| `ss -tlnp` under normal TSI | Always empty. |
+
+**Why pre-emption is necessary for multi-VM:** Without pre-emption, TSI routes all socket operations through the host. When two VMs bind the same port, guest loopback is not isolated — VM-B's `curl localhost:8080` goes through TSI to the host and hits whichever VM the kernel considers the port owner (VM-A), not VM-B's own server. Pre-emption forces guests onto real kernel sockets, making loopback truly local and independent per VM.
