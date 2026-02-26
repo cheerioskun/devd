@@ -101,3 +101,34 @@ No tests exist yet. When adding them:
 - Standard `testing` package, table-driven, files alongside source
 - `db` and `ssh/config.go` are the easiest to unit test (no external deps beyond filesystem)
 - `vm` operations need `krunvm` installed — guard with `testing.Short()` or build tags
+
+## Experiments
+
+The `experiments/` directory contains empirical validation of design decisions — shell scripts, markdown writeups, and sometimes prototype code. **Before making assumptions about performance, networking, or VM behavior, check here first.**
+
+### When to consult experiments/
+
+- You are unsure why a technical constraint exists (e.g., "why not use overlayfs?", "why avoid krun_set_port_map?")
+- You are debugging unexpected behavior in boot, networking, SSH, or port routing
+- You want to understand the measured performance baseline before optimizing
+- You are considering a new architecture (check if it was already tried and abandoned)
+
+### What exists
+
+| Experiment | What it validates |
+|------------|-------------------|
+| exp4–exp7  | Proxy/TSI architecture and port-routing correctness |
+| exp8       | Boot time benchmark (median 0.61s) + switch validation (14/14 PASS). Also reveals SSH key auth fix: `chmod 755 /root` needed for netshoot image |
+| exp9       | VM density under memory pressure |
+| exp10      | `krunvm create` bottleneck = `buildah VFS` full copy. Optimization tiers documented (small image → APFS template clone → erofs direct) |
+| exp11      | `devd-vm` C prototype wrapping libkrun directly. 1.2× speedup, archived — not worth complexity until create latency is user-facing |
+
+### When to add new experiments
+
+If a challenge is non-trivial and you cannot resolve it by reading the code — **add an experiment**:
+
+1. Create `experiments/expN-short-description.sh` (or `.md`) where N is the next number
+2. Add a corresponding `experiments/expN-short-description.md` writeup with: hypothesis, method, results, conclusion
+3. Reference the experiment in any code comment or commit message where the decision is made
+
+This keeps institutional knowledge in the repo, not just in conversation history.

@@ -56,9 +56,9 @@ devd shells out to krunvm/crun for VM lifecycle. On macOS, libkrun uses Apple's 
 | Filesystem | virtio-fs (built into libkrun) | Host ↔ VM code mount at `/workspace` |
 | Networking | libkrun TSI | Transparent socket proxying via vsock |
 | Port proxy | devd daemon (Go, host-side) | Pre-empts contested ports, proxies via SSH tunnels |
-| SSH | devd CA + per-VM certificates | IDE integration, SSH tunnels, `~/.ssh/config` management |
+| SSH | Shared Ed25519 keypair | IDE integration, SSH tunnels, `~/.ssh/config` management |
 | State | [modernc.org/sqlite](https://pkg.go.dev/modernc.org/sqlite) | Workspace metadata, pure Go, no CGO |
-| Base image | Alpine OCI + [Nix](https://nixos.org) | Default ~50MB base, pulled from registry. User can bring any OCI image. |
+| Base image | Any OCI image | User supplies image (e.g. `nicolaka/netshoot`). A small default image (Alpine + Nix, ~50MB) is planned for v0.1.1. |
 | IDE integration | SSH | VS Code Remote-SSH, Cursor, any SSH-capable editor |
 | Env config | [devenv](https://devenv.sh) / devcontainer.json (subset) | User-defined environment |
 
@@ -80,9 +80,11 @@ The VS Code Dev Containers extension requires a Docker-compatible socket. Implem
 
 VS Code Remote-SSH is more mature, works with every editor (Cursor, JetBrains Gateway, Neovim + ssh), and doesn't couple us to Docker's API surface. Port forwarding, terminal access, and extension installation all work over SSH.
 
-### devd CA for SSH key management
+### SSH keypair for workspace access
 
-devd generates a CA key pair on first run (`~/.devd/ca`). Each workspace gets a host certificate signed by the CA. The user's `~/.ssh/config` is configured to trust the devd CA, so connecting to any workspace just works — no manual key acceptance, no known_hosts conflicts when VMs are recreated.
+devd generates a single Ed25519 keypair on first run (`~/.devd/ssh/devd_ed25519`). The public key is injected into each workspace's root authorized_keys at VM creation time. The user's `~/.ssh/config` is updated with a `Host devd-<name>` entry pointing to the right port and key, so `ssh devd-myapp` just works — no manual key acceptance, no known_hosts conflicts.
+
+A CA-based model (per-VM host certificates) is a possible future improvement for fleet-scale use, but the shared keypair is sufficient for local development.
 
 ### Shell out, not CGO
 
@@ -90,7 +92,7 @@ devd shells out to krunvm/crun for VM operations rather than linking libkrun's C
 
 ### Image-agnostic, registry-hosted default
 
-devd does not manage or build images. It pulls OCI images and boots them. A default image (Alpine + Nix, ~50MB) is hosted on a registry and pulled on first use. Users can bring any OCI image.
+devd does not manage or build images. It pulls any OCI image you specify and boots it directly. A small default image (Alpine + Nix, ~50MB) is planned for v0.1.1 — until then, specify any OCI image (e.g. `nicolaka/netshoot`).
 
 ### Cold migration only
 
@@ -240,7 +242,7 @@ Reserved ports are declared in the workspace config (via `forwardPorts` in devco
 
 | Version | Scope | Success Criteria |
 |---------|-------|------------------|
-| **v0.1** | Local lifecycle + switch | `devd new myapp && devd shell myapp` works. sshd running. VS Code Remote-SSH connects. File mount bidirectional. `devd switch` routes contested ports via proxy. |
+| **v0.1** | Local lifecycle + switch | `devd run nicolaka/netshoot --name myapp && devd ssh myapp` works. sshd running. VS Code Remote-SSH connects. File mount bidirectional. `devd switch` routes contested ports via proxy. |
 | **v0.2** | Snapshots | `devd snapshot myapp` produces tarball + JSON sidecar. `devd restore` recreates workspace from snapshot. |
 | **v0.3** | Remote storage | `devd snapshot --to s3://...` works. Restore on a fresh machine from S3. |
 | **v0.4** | Remote nodes | `devd new --remote <server>`. Server runs devd in agent mode. SSH/mTLS control plane. |
@@ -249,7 +251,9 @@ Reserved ports are declared in the workspace config (via `forwardPorts` in devco
 
 ### v0.1 Scope Boundaries
 
-**In scope**: Workspace lifecycle (new/shell/list/stop/rm), `devd switch` via proxy-based port routing, microVM per workspace, host code mount, SSH access (devd CA), devcontainer.json subset, base image selection.
+**In scope**: Workspace lifecycle (create/run/ssh/stop/rm), `devd switch` via proxy-based port routing, microVM per workspace, SSH access (shared keypair), base image selection (any OCI image).
+
+**v0.1.2**: devcontainer.json subset (postCreateCommand, forwardPorts, dotfiles).
 
 **Out of scope**: Remote nodes, live migration, full devcontainer spec, IDE plugins, image building, dynamic port detection.
 

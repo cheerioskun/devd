@@ -5,13 +5,16 @@ Lightweight, isolated, movable development workspaces powered by microVMs.
 ```
 $ devd run nicolaka/netshoot --name myapp
 INFO Creating workspace "myapp" (nicolaka/netshoot, 2 CPUs, 512 MB)
-INFO Created in 10.39s
+INFO Created in 13.31s
 INFO Starting VM...
+INFO Waiting for SSH on port 2222...
 INFO SSH ready
 
      Name:    myapp
+     Image:   nicolaka/netshoot
      SSH:     ssh devd-myapp  (or: devd ssh myapp)
-     Boot:    0.61s
+     Port:    2222
+     Boot:    1.01s
 
 $ devd ssh myapp
 root@myapp:~#
@@ -49,7 +52,7 @@ devd skips the intermediary. libkrun talks directly to Apple's Hypervisor.framew
 | Background overhead | ~2-4GB RAM always | ~1-2GB RAM always | 0 when no workspaces running |
 | Per-workspace isolation | Shared kernel | Shared kernel | Separate kernel per workspace |
 | Workspace switching | N/A | N/A | `devd switch` — instant, zero-disruption |
-| Boot to SSH | N/A | ~5-30s (machine start) | **0.6s** (measured) |
+| Boot to SSH | N/A | ~5-30s (machine start) | **~1s** (measured) |
 
 On Linux, devd uses the same libkrun microVMs (via KVM). Same CLI, same behavior.
 
@@ -73,8 +76,9 @@ go build -o bin/devd ./cmd/devd
 devd run nicolaka/netshoot --name myapp
 devd ssh myapp
 
-# Or, step by step (required for multi-workspace port routing)
+# Step-by-step (use this when you need multi-workspace port routing)
 devd create nicolaka/netshoot --name myapp --ports 8080
+devd daemon &        # only needed when multiple workspaces share a port
 devd start myapp
 ```
 
@@ -174,10 +178,10 @@ When you create a workspace, `Host devd-<name>` appears in your SSH config. When
 
 Measured on macOS ARM64, krunvm 0.2.6, nicolaka/netshoot image ([experiment 8](experiments/exp8-devd-boot-and-switch.md)):
 
-| Metric | Median | Notes |
-|--------|--------|-------|
-| Boot (start → SSH ready) | **0.61s** | The time that matters for `devd start` |
-| Create (OCI extraction) | 10.39s | One-time cost per workspace via krunvm |
+| Metric | Value | Notes |
+|--------|-------|-------|
+| Boot (start → SSH ready) | **~1.0s** | Measured across multiple runs; exp8 median 0.61s on a warmed system |
+| Create (OCI extraction) | ~10–16s | One-time cost per workspace; varies with image size and host I/O |
 | Switch latency | <200ms | Next connection routes to new workspace |
 | Guest loopback | Isolated | Each VM reaches its own server |
 
