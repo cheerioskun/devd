@@ -28,11 +28,11 @@ before any VMs start.`,
 }
 
 var (
-	createName   string
-	createCPUs   int
-	createMemory int
-	createPorts  []int
-	createMount  string
+	createName    string
+	createCPUs    int
+	createMemory  int
+	createPorts   []int
+	createMount   string
 	createUserCmd string
 )
 
@@ -137,7 +137,9 @@ func doCreate(name, image string, cpus, memory int, ports []int, mount, userCmd 
 		IsActive:  false,
 	}
 	if err := db.CreateWorkspace(database, ws); err != nil {
-		vm.Delete(name)
+		if delErr := vm.Delete(name); delErr != nil {
+			fmt.Printf("WARN cleanup vm: %v\n", delErr)
+		}
 		return nil, fmt.Errorf("record workspace: %w", err)
 	}
 
@@ -153,7 +155,9 @@ func doCreate(name, image string, cpus, memory int, ports []int, mount, userCmd 
 	for _, w := range allWs {
 		entries = append(entries, ssh.SSHConfigEntry{Name: w.Name, Port: w.SSHPort})
 	}
-	ssh.UpdateSSHConfig(entries)
+	if err := ssh.UpdateSSHConfig(entries); err != nil {
+		fmt.Printf("WARN update ssh config: %v\n", err)
+	}
 
 	fmt.Printf("INFO Workspace %q created (stopped). Use 'devd start %s' to boot.\n", name, name)
 	fmt.Printf("     SSH port: %d, Relay port: %d\n", sshPort, relayPort)

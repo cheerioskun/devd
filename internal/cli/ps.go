@@ -40,7 +40,9 @@ func runPs(cmd *cobra.Command, args []string) error {
 	// Reconcile state: check if PIDs are still alive
 	for _, ws := range workspaces {
 		if ws.State == "running" && !vm.IsRunning(ws.PID) {
-			db.SetWorkspaceState(database, ws.Name, "stopped", 0)
+			if err := db.SetWorkspaceState(database, ws.Name, "stopped", 0); err != nil {
+				fmt.Printf("WARN reconcile %s: %v\n", ws.Name, err)
+			}
 			ws.State = "stopped"
 			ws.PID = 0
 		}

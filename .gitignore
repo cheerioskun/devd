@@ -11,3 +11,4 @@ devenv.local.yaml
 
 # build output
 bin/
+/devd

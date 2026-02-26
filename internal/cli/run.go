@@ -81,13 +81,27 @@ func runRun(cmd *cobra.Command, args []string) error {
 		LogFile: logFile,
 	})
 	if err != nil {
-		db.DeleteWorkspace(database, flagName)
-		vm.Delete(flagName)
+		if delErr := db.DeleteWorkspace(database, flagName); delErr != nil {
+			fmt.Printf("WARN cleanup db: %v\n", delErr)
+		}
+		if delErr := vm.Delete(flagName); delErr != nil {
+			fmt.Printf("WARN cleanup vm: %v\n", delErr)
+		}
 		return fmt.Errorf("start VM: %w", err)
 	}
 
-	db.SetWorkspaceState(database, flagName, "running", pid)
-	db.SetActiveWorkspace(database, flagName)
+	if err := db.SetWorkspaceState(database, flagName, "running", pid); err != nil {
+		if stopErr := vm.Stop(pid); stopErr != nil {
+			fmt.Printf("WARN stop vm after db failure: %v\n", stopErr)
+		}
+		return fmt.Errorf("update state: %w", err)
+	}
+	if err := db.SetActiveWorkspace(database, flagName); err != nil {
+		if stopErr := vm.Stop(pid); stopErr != nil {
+			fmt.Printf("WARN stop vm after db failure: %v\n", stopErr)
+		}
+		return fmt.Errorf("set active: %w", err)
+	}
 
 	fmt.Printf("INFO Waiting for SSH on port %d...\n", ws.SSHPort)
 	sshReady := waitForSSH(ws.SSHPort, 30*time.Second)

@@ -3,7 +3,7 @@
 ## Prerequisites
 
 - macOS (Apple Silicon) or Linux
-- [krunvm](https://github.com/containers/krunvm) installed (`brew install krunvm` on macOS)
+- [krunvm](https://github.com/containers/krunvm) — provided by Nix on Linux; on macOS run `install-krunvm` inside the devenv shell
 
 ## Dev Environment Setup
 
@@ -27,7 +27,10 @@ Inside the devenv shell:
 | `build` | `go build -o bin/devd ./cmd/devd` |
 | `test`  | `go test ./...` |
 | `lint`  | `golangci-lint run` |
+| `check` | gofmt + vet + lint + test (use before `jj commit`) |
+| `setup` | `go mod download` |
 | `clean` | Remove `bin/` |
+| `install-krunvm` | Install krunvm (macOS: brew, Fedora: dnf) |
 
 ## Project Structure
 
@@ -43,13 +46,18 @@ internal/
 experiments/       Networking experiments validating the proxy architecture
 ```
 
-## Git Hooks
+## Git Hooks / jj Workflow
 
-Pre-commit hooks run automatically via devenv:
+Pre-commit hooks (gofmt, govet, golangci-lint) are configured via devenv's git-hooks integration. These fire on `git commit`, which jj uses internally.
 
-- **gofmt** — format check
-- **govet** — static analysis
-- **golangci-lint** — comprehensive linting
+However, `jj commit` does **not** always trigger git pre-commit hooks reliably. Run `check` manually before committing:
+
+```bash
+check
+jj commit -m "your message"
+```
+
+The `check` script runs the same validations as the git hooks plus `go test`.
 
 ## Code Style
 
@@ -61,7 +69,8 @@ Pre-commit hooks run automatically via devenv:
 ## Testing
 
 ```bash
-test
+test     # go test ./...
+check    # full gate: gofmt + vet + lint + test
 ```
 
 For experiments (networking/proxy validation), see the `experiments/` directory. Each experiment has a markdown doc explaining what it tests and the results.

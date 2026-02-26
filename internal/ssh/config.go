@@ -16,8 +16,8 @@ const (
 
 // SSHConfigEntry represents an entry for ~/.ssh/config.
 type SSHConfigEntry struct {
-	Name    string
-	Port    int
+	Name string
+	Port int
 }
 
 // UpdateSSHConfig rewrites the devd-managed block in ~/.ssh/config.

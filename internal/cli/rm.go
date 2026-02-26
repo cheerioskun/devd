@@ -45,7 +45,9 @@ func runRm(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("workspace %q is running — use -f to force remove", name)
 		}
 		fmt.Printf("INFO Stopping workspace %q...\n", name)
-		vm.Stop(ws.PID)
+		if err := vm.Stop(ws.PID); err != nil {
+			fmt.Printf("WARN stop vm: %v\n", err)
+		}
 	}
 
 	fmt.Printf("INFO Removing workspace %q...\n", name)
@@ -57,7 +59,9 @@ func runRm(cmd *cobra.Command, args []string) error {
 
 	// Remove workspace directory
 	if ws.RootfsDir != "" {
-		os.RemoveAll(ws.RootfsDir)
+		if err := os.RemoveAll(ws.RootfsDir); err != nil {
+			fmt.Printf("WARN remove workspace dir: %v\n", err)
+		}
 	}
 
 	// Remove from database
@@ -71,7 +75,9 @@ func runRm(cmd *cobra.Command, args []string) error {
 	for _, w := range allWs {
 		entries = append(entries, ssh.SSHConfigEntry{Name: w.Name, Port: w.SSHPort})
 	}
-	ssh.UpdateSSHConfig(entries)
+	if err := ssh.UpdateSSHConfig(entries); err != nil {
+		fmt.Printf("WARN update ssh config: %v\n", err)
+	}
 
 	fmt.Printf("INFO Workspace %q removed\n", name)
 	return nil

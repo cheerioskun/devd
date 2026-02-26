@@ -42,7 +42,9 @@ func runStop(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("stop VM: %w", err)
 	}
 
-	db.SetWorkspaceState(database, name, "stopped", 0)
+	if err := db.SetWorkspaceState(database, name, "stopped", 0); err != nil {
+		return fmt.Errorf("update state: %w", err)
+	}
 	fmt.Printf("INFO Workspace %q stopped\n", name)
 	return nil
 }

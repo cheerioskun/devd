@@ -24,7 +24,7 @@ type CreateOpts struct {
 	Name    string
 	Image   string
 	CPUs    int
-	Memory  int            // MB
+	Memory  int               // MB
 	Volumes map[string]string // host:guest
 }
 

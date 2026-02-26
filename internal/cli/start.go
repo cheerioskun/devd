@@ -55,8 +55,18 @@ func runStart(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("start VM: %w", err)
 	}
 
-	db.SetWorkspaceState(database, name, "running", pid)
-	db.SetActiveWorkspace(database, name)
+	if err := db.SetWorkspaceState(database, name, "running", pid); err != nil {
+		if stopErr := vm.Stop(pid); stopErr != nil {
+			fmt.Printf("WARN stop vm after db failure: %v\n", stopErr)
+		}
+		return fmt.Errorf("update state: %w", err)
+	}
+	if err := db.SetActiveWorkspace(database, name); err != nil {
+		if stopErr := vm.Stop(pid); stopErr != nil {
+			fmt.Printf("WARN stop vm after db failure: %v\n", stopErr)
+		}
+		return fmt.Errorf("set active: %w", err)
+	}
 
 	fmt.Printf("INFO Waiting for SSH on port %d...\n", ws.SSHPort)
 	sshReady := waitForSSH(ws.SSHPort, 30*time.Second)
