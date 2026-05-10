@@ -112,6 +112,7 @@ func doCreate(name, image string, cpus, memory int, ports []int, mount, userCmd 
 	}
 
 	fmt.Printf("INFO Creating workspace %q (%s, %d CPUs, %d MB)\n", name, image, cpus, memory)
+	fmt.Printf("INFO Pulling and extracting image (this may take 10-20s on first run)...\n")
 	createStart := time.Now()
 
 	if _, err := vm.Create(vm.CreateOpts{
@@ -170,6 +171,22 @@ func runCreate(cmd *cobra.Command, args []string) error {
 	if len(args) > 0 {
 		image = args[0]
 	}
+
+	if dc, _ := config.LoadDevContainer("."); dc != nil {
+		if len(args) == 0 && dc.Image != "" {
+			image = dc.Image
+		}
+		if len(createPorts) == 0 && len(dc.ForwardPorts) > 0 {
+			createPorts = dc.ForwardPorts
+		}
+		if createUserCmd == "" && dc.PostCreateCommand != "" {
+			createUserCmd = dc.PostCreateCommand
+		}
+		if createMount == "" {
+			createMount = ".:/workspace"
+		}
+	}
+
 	_, err := doCreate(createName, image, createCPUs, createMemory, createPorts, createMount, createUserCmd)
 	return err
 }

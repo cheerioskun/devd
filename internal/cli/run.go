@@ -55,6 +55,21 @@ func runRun(cmd *cobra.Command, args []string) error {
 		image = args[0]
 	}
 
+	if dc, _ := config.LoadDevContainer("."); dc != nil {
+		if len(args) == 0 && dc.Image != "" {
+			image = dc.Image
+		}
+		if len(flagPorts) == 0 && len(dc.ForwardPorts) > 0 {
+			flagPorts = dc.ForwardPorts
+		}
+		if flagCmd == "" && dc.PostCreateCommand != "" {
+			flagCmd = dc.PostCreateCommand
+		}
+		if flagMount == "" {
+			flagMount = ".:/workspace"
+		}
+	}
+
 	// Phase 1: create
 	ws, err := doCreate(flagName, image, flagCPUs, flagMemory, flagPorts, flagMount, flagCmd)
 	if err != nil {
