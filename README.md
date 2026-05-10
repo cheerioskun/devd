@@ -1,5 +1,8 @@
 # devd
 
+[![CI](https://github.com/your/devd/actions/workflows/ci.yml/badge.svg)](https://github.com/your/devd/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+
 Lightweight, isolated, movable development workspaces powered by microVMs.
 
 ```
@@ -64,6 +67,10 @@ On Linux, devd uses the same libkrun microVMs (via KVM). Same CLI, same behavior
 
 ## Install
 
+**Option 1: Download binary (Recommended)**
+Download the latest release for your platform (macOS ARM64/AMD64, Linux) from the [Releases page](https://github.com/your/devd/releases).
+
+**Option 2: Build from source**
 ```bash
 git clone https://github.com/your/devd && cd devd
 go build -o bin/devd ./cmd/devd
