@@ -12,13 +12,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       
-      - name: Install Nix
-        uses: cachix/install-nix-action@v25
+      - name: Setup Go
+        uses: actions/setup-go@v5
         with:
-          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          go-version: stable
           
-      - name: Setup Devenv
-        uses: cachix/devenv-action@v3
+      - name: Build
+        run: go build ./cmd/devd
         
-      - name: Run checks
-        run: devenv run check
+      - name: Vet
+        run: go vet ./...
+        
+      - name: Test
+        run: go test ./...
