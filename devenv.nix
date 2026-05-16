@@ -85,6 +85,27 @@
     echo "Done."
   '';
 
+  scripts.setup-jj.exec = ''
+    set -euo pipefail
+    if jj root &>/dev/null; then
+      echo "jj is already initialized: $(jj root)"
+      exit 0
+    fi
+    if [ ! -d .git ]; then
+      echo "ERROR: .git not found; clone this repo first, then run setup-jj"
+      exit 1
+    fi
+
+    echo "Initializing colocated jj repo..."
+    jj git init --colocate
+
+    if jj bookmark list --remote origin 2>/dev/null | grep -q '^main@origin:'; then
+      jj bookmark track main --remote=origin 2>/dev/null || true
+    fi
+
+    echo "Done. Use: jj st, jj log -r 'all()'"
+  '';
+
   scripts.install-krunvm.exec = ''
     set -euo pipefail
     if command -v krunvm &>/dev/null; then
@@ -112,11 +133,17 @@
     echo "  lint   \u2014 golangci-lint run"
     echo "  check  \u2014 gofmt + vet + lint + test (pre-commit substitute for jj)"
     echo "  setup  \u2014 go mod download"
+    echo "  setup-jj \u2014 initialize jj after a plain git clone"
     echo "  clean  \u2014 rm -rf bin/"
     echo "  install-krunvm \u2014 install krunvm (macOS: brew, Fedora: dnf)"
     echo ""
     go version
     jj version 2>/dev/null || true
+
+    if [ -d .git ] && [ ! -d .jj ]; then
+      echo ""
+      echo "INFO this repo uses jj. Run: setup-jj"
+    fi
 
     # Warn if krunvm is not installed (provided by Nix on Linux, manual on macOS)
     if ! command -v krunvm &>/dev/null; then
