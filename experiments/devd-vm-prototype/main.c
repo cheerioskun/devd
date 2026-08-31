@@ -11,6 +11,10 @@
  *   --disk <path>   Raw ext4 disk image as root block device.
  *                    Use with APFS-cloned images for ~10ms create.
  *
+ * Directory-root mode also accepts one --data-disk. Experiment 12 uses this
+ * to populate an empty ext4 image from inside a helper VM, preserving the OCI
+ * rootfs metadata as exposed by libkrun's macOS virtio-fs implementation.
+ *
  * Usage:
  *   devd-vm --root /path/to/rootfs --cpus 2 --mem 512 \
  *           --virtiofs devd:/home/user/.devd \
@@ -43,6 +47,7 @@ struct virtiofs_mount {
 struct vm_config {
 	const char *root_dir;
 	const char *disk_path;
+	const char *data_disk_path;
 	uint8_t cpus;
 	uint32_t mem_mib;
 	const char *workdir;
@@ -66,6 +71,7 @@ static void usage(void)
 		"Options:\n"
 		"  --root <dir>          Root directory (virtio-fs)\n"
 		"  --disk <path>         Root disk image (raw ext4)\n"
+		"  --data-disk <path>    Data disk image (raw; --root mode only)\n"
 		"  --cpus <n>            vCPUs (default: 2)\n"
 		"  --mem <n>             RAM in MiB (default: 512)\n"
 		"  --virtiofs <tag:path> Add virtio-fs mount (max %d, repeatable)\n"
@@ -120,6 +126,8 @@ static bool parse_args(int argc, char **argv, struct vm_config *cfg)
 			cfg->root_dir = argv[++i];
 		} else if (strcmp(argv[i], "--disk") == 0 && i + 1 < argc) {
 			cfg->disk_path = argv[++i];
+		} else if (strcmp(argv[i], "--data-disk") == 0 && i + 1 < argc) {
+			cfg->data_disk_path = argv[++i];
 		} else if (strcmp(argv[i], "--cpus") == 0 && i + 1 < argc) {
 			cfg->cpus = (uint8_t)atoi(argv[++i]);
 		} else if (strcmp(argv[i], "--mem") == 0 && i + 1 < argc) {
@@ -158,6 +166,10 @@ static bool parse_args(int argc, char **argv, struct vm_config *cfg)
 	}
 	if (cfg->root_dir && cfg->disk_path) {
 		fprintf(stderr, PROG ": --root and --disk are mutually exclusive\n");
+		return false;
+	}
+	if (cfg->data_disk_path && !cfg->root_dir) {
+		fprintf(stderr, PROG ": --data-disk is only supported with --root\n");
 		return false;
 	}
 	if (i >= argc) {
@@ -204,8 +216,15 @@ int main(int argc, char **argv)
 		KRUN_CHECK(krun_set_root(ctx_id, cfg.root_dir),
 			   "krun_set_root");
 	} else {
-		KRUN_CHECK(krun_set_root_disk(ctx_id, cfg.disk_path),
-			   "krun_set_root_disk");
+		KRUN_CHECK(krun_add_disk(ctx_id, "root", cfg.disk_path, false),
+			   "krun_add_disk(root)");
+		KRUN_CHECK(krun_set_root_disk_remount(ctx_id, "/dev/vda", "ext4", NULL),
+			   "krun_set_root_disk_remount");
+	}
+
+	if (cfg.data_disk_path) {
+		KRUN_CHECK(krun_add_disk(ctx_id, "data", cfg.data_disk_path, false),
+			   "krun_add_disk");
 	}
 
 	for (int i = 0; i < cfg.fs_count; i++) {

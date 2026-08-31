@@ -2,6 +2,7 @@ package vm
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -9,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // CheckKrunvm verifies krunvm is installed and accessible.
@@ -72,22 +74,29 @@ func Start(opts StartOpts) (int, error) {
 	// Set process group so the VM survives if devd exits
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
+	var logFile *os.File
 	if opts.LogFile != "" {
 		f, err := os.OpenFile(opts.LogFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 		if err != nil {
 			return 0, fmt.Errorf("open log file: %w", err)
 		}
+		logFile = f
 		cmd.Stdout = f
 		cmd.Stderr = f
-		// Don't close f here — the krunvm process needs it.
-		// It will be closed when krunvm exits.
 	}
 
 	if err := cmd.Start(); err != nil {
+		if logFile != nil {
+			_ = logFile.Close()
+		}
 		return 0, fmt.Errorf("krunvm start: %w", err)
 	}
+	// The child inherited its own descriptor during Start.
+	if logFile != nil {
+		_ = logFile.Close()
+	}
 
-	// Detach — don't wait. The process runs independently.
+	// Detach — don't wait synchronously. Wait in the background to reap the process.
 	go cmd.Wait()
 
 	return cmd.Process.Pid, nil
@@ -105,7 +114,7 @@ func Delete(name string) error {
 	return nil
 }
 
-// Stop kills the krunvm process by PID.
+// Stop terminates the krunvm process and waits for it to release host resources.
 func Stop(pid int) error {
 	if pid <= 0 {
 		return nil
@@ -114,12 +123,34 @@ func Stop(pid int) error {
 	if err != nil {
 		return nil // process not found, already dead
 	}
-	// Try SIGTERM first
 	if err := proc.Signal(syscall.SIGTERM); err != nil {
-		// Already dead
+		if errors.Is(err, os.ErrProcessDone) {
+			return nil
+		}
+		return fmt.Errorf("signal PID %d: %w", pid, err)
+	}
+	if waitForExit(pid, 5*time.Second) {
 		return nil
 	}
+
+	if err := proc.Signal(syscall.SIGKILL); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		return fmt.Errorf("kill PID %d after timeout: %w", pid, err)
+	}
+	if !waitForExit(pid, 5*time.Second) {
+		return fmt.Errorf("PID %d did not exit after SIGKILL", pid)
+	}
 	return nil
+}
+
+func waitForExit(pid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if !IsRunning(pid) {
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return !IsRunning(pid)
 }
 
 // IsRunning checks if a process with the given PID is still alive.

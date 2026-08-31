@@ -45,6 +45,10 @@ func runStart(cmd *cobra.Command, args []string) error {
 	fmt.Printf("INFO Starting workspace %q...\n", name)
 	bootStart := time.Now()
 
+	if err := ensurePortAvailable(ws.SSHPort); err != nil {
+		return fmt.Errorf("start workspace %q: %w", name, err)
+	}
+
 	pid, err := vm.Start(vm.StartOpts{
 		Name:    name,
 		Command: "/bin/sh",
@@ -69,15 +73,17 @@ func runStart(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("INFO Waiting for SSH on port %d...\n", ws.SSHPort)
-	sshReady := waitForSSH(ws.SSHPort, 30*time.Second)
+	if err := waitForSSH(ws.SSHPort, pid, 30*time.Second); err != nil {
+		if stopErr := vm.Stop(pid); stopErr != nil {
+			fmt.Printf("WARN stop VM after startup failure: %v\n", stopErr)
+		} else if stateErr := db.SetWorkspaceState(database, name, "stopped", 0); stateErr != nil {
+			fmt.Printf("WARN update state after startup failure: %v\n", stateErr)
+		}
+		return fmt.Errorf("workspace %q failed to start: %w (check log: %s)", name, err, logFile)
+	}
 	bootElapsed := time.Since(bootStart)
 
-	if !sshReady {
-		fmt.Printf("WARN SSH not ready after 30s. Check log: %s\n", logFile)
-	} else {
-		fmt.Printf("INFO SSH ready in %.2fs\n", bootElapsed.Seconds())
-	}
-
+	fmt.Printf("INFO SSH ready in %.2fs\n", bootElapsed.Seconds())
 	fmt.Printf("     PID: %d\n", pid)
 	return nil
 }

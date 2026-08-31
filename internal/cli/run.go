@@ -89,6 +89,10 @@ func runRun(cmd *cobra.Command, args []string) error {
 	fmt.Println("INFO Starting VM...")
 	bootStart := time.Now()
 
+	if err := ensurePortAvailable(ws.SSHPort); err != nil {
+		return fmt.Errorf("start workspace %q: %w", flagName, err)
+	}
+
 	pid, err := vm.Start(vm.StartOpts{
 		Name:    flagName,
 		Command: "/bin/sh",
@@ -119,16 +123,18 @@ func runRun(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("INFO Waiting for SSH on port %d...\n", ws.SSHPort)
-	sshReady := waitForSSH(ws.SSHPort, 30*time.Second)
+	if err := waitForSSH(ws.SSHPort, pid, 30*time.Second); err != nil {
+		if stopErr := vm.Stop(pid); stopErr != nil {
+			fmt.Printf("WARN stop VM after startup failure: %v\n", stopErr)
+		} else if stateErr := db.SetWorkspaceState(database, flagName, "stopped", 0); stateErr != nil {
+			fmt.Printf("WARN update state after startup failure: %v\n", stateErr)
+		}
+		return fmt.Errorf("workspace %q failed to start: %w (check log: %s)", flagName, err, logFile)
+	}
 
 	bootElapsed := time.Since(bootStart)
 	totalElapsed := time.Since(totalStart)
-
-	if !sshReady {
-		fmt.Printf("WARN SSH not ready after 30s. Check log: %s\n", logFile)
-	} else {
-		fmt.Printf("INFO SSH ready\n")
-	}
+	fmt.Printf("INFO SSH ready\n")
 
 	fmt.Println()
 	fmt.Printf("     Name:    %s\n", flagName)
@@ -144,18 +150,35 @@ func runRun(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-// waitForSSH polls the SSH port until a connection succeeds or timeout.
-func waitForSSH(port int, timeout time.Duration) bool {
+// ensurePortAvailable catches stale VMs or other processes before booting a guest
+// whose sshd would then fail permanently with EADDRINUSE.
+func ensurePortAvailable(port int) error {
+	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("SSH port %d is already in use: %w", port, err)
+	}
+	if err := listener.Close(); err != nil {
+		return fmt.Errorf("release SSH port %d after availability check: %w", port, err)
+	}
+	return nil
+}
+
+// waitForSSH polls the SSH port until a connection succeeds, the VM exits, or timeout.
+func waitForSSH(port, pid int, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
 
 	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp", addr, 1*time.Second)
+		if !vm.IsRunning(pid) {
+			return fmt.Errorf("VM process exited before SSH became ready")
+		}
+		conn, err := net.DialTimeout("tcp", addr, time.Second)
 		if err == nil {
 			conn.Close()
-			return true
+			return nil
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	return false
+	return fmt.Errorf("SSH not ready on port %d after %s", port, timeout)
 }

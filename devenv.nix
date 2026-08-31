@@ -3,6 +3,7 @@
 {
   # https://devenv.sh/packages/
   packages = [
+    pkgs.e2fsprogs
     pkgs.git
     pkgs.golangci-lint
     pkgs.jujutsu
