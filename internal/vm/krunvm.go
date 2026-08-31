@@ -3,6 +3,7 @@ package vm
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"strconv"
@@ -44,8 +45,9 @@ func Create(opts CreateOpts) (string, error) {
 
 	cmd := exec.Command("krunvm", args...)
 	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = io.MultiWriter(os.Stdout, &out)
+	cmd.Stderr = io.MultiWriter(os.Stderr, &out)
 	if err := cmd.Run(); err != nil {
 		return out.String(), fmt.Errorf("krunvm create: %w\n%s", err, out.String())
 	}
