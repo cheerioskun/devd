@@ -3,8 +3,6 @@ package cli
 import (
 	"fmt"
 	"os"
-	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -12,17 +10,18 @@ import (
 	"devd/internal/config"
 	"devd/internal/db"
 	"devd/internal/ssh"
+	"devd/internal/storage"
 	"devd/internal/vm"
 )
 
 var createCmd = &cobra.Command{
 	Use:   "create [image]",
-	Short: "Create a workspace without starting it",
-	Long: `Create a new microVM workspace definition. Like 'ignite create'.
-The VM is registered but not started — use 'devd start' to boot it.
+	Short: "Create an ext4-backed workspace without starting it",
+	Long: `Create a stopped microVM workspace by cloning a cached ext4 image.
+The first use of an OCI digest prepares its immutable disk template; subsequent
+creates clone one file and complete in milliseconds.
 
-This is useful when you need the daemon to pre-empt contested ports
-before any VMs start.`,
+Start the daemon before VMs when contested ports must be pre-empted.`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runCreate,
 }
@@ -43,12 +42,29 @@ func init() {
 	createCmd.Flags().IntSliceVar(&createPorts, "ports", nil, "ports to reserve (contested ports get proxied)")
 	createCmd.Flags().StringVar(&createMount, "mount", "", "host:guest volume mount (e.g. .:/workspace)")
 	createCmd.Flags().StringVar(&createUserCmd, "cmd", "", "command to run inside VM after boot")
-	createCmd.MarkFlagRequired("name")
+	_ = createCmd.MarkFlagRequired("name")
 }
 
-// doCreate handles the create-only logic. Returns the workspace record.
+// doCreate handles create-only logic shared by create and run.
 func doCreate(name, image string, cpus, memory int, ports []int, mount, userCmd string) (*db.Workspace, error) {
-	if err := vm.CheckKrunvm(); err != nil {
+	if err := config.ValidateWorkspaceName(name); err != nil {
+		return nil, err
+	}
+	if cpus <= 0 || cpus > 255 {
+		return nil, fmt.Errorf("cpus must be between 1 and 255")
+	}
+	if memory <= 0 {
+		return nil, fmt.Errorf("memory must be greater than zero")
+	}
+	if err := vm.CheckRuntime(); err != nil {
+		return nil, err
+	}
+	if err := storage.CheckDependencies(); err != nil {
+		return nil, err
+	}
+
+	mountHost, mountGuest, err := parseMount(mount)
+	if err != nil {
 		return nil, err
 	}
 
@@ -58,8 +74,12 @@ func doCreate(name, image string, cpus, memory int, ports []int, mount, userCmd 
 	}
 	defer database.Close()
 
-	if existing, _ := db.GetWorkspace(database, name); existing != nil {
-		return nil, fmt.Errorf("workspace %q already exists (state: %s)", name, existing.State)
+	exists, err := db.WorkspaceExists(database, name)
+	if err != nil {
+		return nil, fmt.Errorf("check workspace name: %w", err)
+	}
+	if exists {
+		return nil, fmt.Errorf("workspace %q already exists", name)
 	}
 
 	sshPort, err := db.NextSSHPort(database)
@@ -70,99 +90,97 @@ func doCreate(name, image string, cpus, memory int, ports []int, mount, userCmd 
 	if err != nil {
 		return nil, fmt.Errorf("allocate relay port: %w", err)
 	}
-
-	pubKey, err := ssh.EnsureKeypair()
-	if err != nil {
+	if _, err := ssh.EnsureKeypair(); err != nil {
 		return nil, fmt.Errorf("ssh keypair: %w", err)
+	}
+
+	fmt.Printf("INFO Preparing image %q...\n", storage.QualifyImage(image))
+	prepareStart := time.Now()
+	template, err := storage.EnsureTemplate(image)
+	if err != nil {
+		return nil, fmt.Errorf("prepare image: %w", err)
+	}
+	if template.Cached {
+		fmt.Printf("INFO Using cached ext4 template %s\n", template.Manifest.Digest)
+	} else {
+		fmt.Printf("INFO Prepared ext4 template in %.2fs\n", time.Since(prepareStart).Seconds())
 	}
 
 	wsDir, err := config.WorkspaceDir(name)
 	if err != nil {
 		return nil, fmt.Errorf("workspace dir: %w", err)
 	}
-
-	_, err = vm.WriteInitScript(wsDir, vm.GuestInitOpts{
-		Label:     name,
-		SSHPort:   sshPort,
-		PublicKey: strings.TrimSpace(pubKey),
-		UserCmd:   userCmd,
-	})
+	diskPath, err := config.WorkspaceDiskPath(name)
 	if err != nil {
-		return nil, fmt.Errorf("write init script: %w", err)
+		return nil, fmt.Errorf("workspace disk path: %w", err)
 	}
-
-	devdDir, err := config.DevdDir()
-	if err != nil {
-		return nil, fmt.Errorf("devd dir: %w", err)
-	}
-	volumes := map[string]string{
-		devdDir: "/devd",
-	}
-	if mount != "" {
-		parts := strings.SplitN(mount, ":", 2)
-		if len(parts) != 2 {
-			return nil, fmt.Errorf("--mount must be host:guest (e.g. .:/workspace)")
+	createdRecord := false
+	success := false
+	defer func() {
+		if success {
+			return
 		}
-		hostPath := parts[0]
-		if !filepath.IsAbs(hostPath) {
-			cwd, _ := os.Getwd()
-			hostPath = filepath.Join(cwd, hostPath)
+		if createdRecord {
+			_ = db.DeleteWorkspace(database, name)
 		}
-		volumes[hostPath] = parts[1]
+		_ = os.RemoveAll(wsDir)
+	}()
+
+	cloneStart := time.Now()
+	if err := storage.CloneDisk(template.DiskPath, diskPath); err != nil {
+		return nil, err
 	}
+	fmt.Printf("INFO Cloned workspace disk in %s\n", time.Since(cloneStart).Round(time.Millisecond))
 
-	fmt.Printf("INFO Creating workspace %q (%s, %d CPUs, %d MB)\n", name, image, cpus, memory)
-	fmt.Printf("INFO Pulling and extracting image (this may take 10-20s on first run)...\n")
-	createStart := time.Now()
-
-	if _, err := vm.Create(vm.CreateOpts{
-		Name:    name,
-		Image:   image,
-		CPUs:    cpus,
-		Memory:  memory,
-		Volumes: volumes,
+	workspaceCfg := storage.WorkspaceConfig{
+		Image:       template.Manifest.Image,
+		ImageDigest: template.Manifest.Digest,
+		Environment: template.Manifest.Environment,
+		WorkingDir:  template.Manifest.WorkingDir,
+		UserCommand: userCmd,
+		MountHost:   mountHost,
+		MountGuest:  mountGuest,
+	}
+	if err := storage.WriteWorkspaceConfig(wsDir, workspaceCfg); err != nil {
+		return nil, fmt.Errorf("write workspace config: %w", err)
+	}
+	if err := vm.WriteWorkspaceFiles(wsDir, vm.WorkspaceFilesOpts{
+		UserCommand:  userCmd,
+		ImageWorkdir: template.Manifest.WorkingDir,
+		MountGuest:   mountGuest,
 	}); err != nil {
-		return nil, fmt.Errorf("create VM: %w", err)
+		return nil, err
 	}
-	fmt.Printf("INFO Created in %.2fs\n", time.Since(createStart).Seconds())
 
 	ws := &db.Workspace{
-		Name:      name,
-		Image:     image,
-		RootfsDir: wsDir,
-		SSHPort:   sshPort,
-		RelayPort: relayPort,
-		CPUs:      cpus,
-		Memory:    memory,
-		State:     "stopped",
-		IsActive:  false,
+		Name:         name,
+		Image:        template.Manifest.Image,
+		ImageDigest:  template.Manifest.Digest,
+		WorkspaceDir: wsDir,
+		DiskPath:     diskPath,
+		SSHPort:      sshPort,
+		RelayPort:    relayPort,
+		CPUs:         cpus,
+		Memory:       memory,
+		State:        "stopped",
 	}
 	if err := db.CreateWorkspace(database, ws); err != nil {
-		if delErr := vm.Delete(name); delErr != nil {
-			fmt.Printf("WARN cleanup vm: %v\n", delErr)
-		}
 		return nil, fmt.Errorf("record workspace: %w", err)
 	}
-
-	for _, p := range ports {
-		if err := db.AddReservedPort(database, name, p); err != nil {
-			return nil, fmt.Errorf("reserve port %d: %w", p, err)
+	createdRecord = true
+	for _, port := range ports {
+		if err := db.AddReservedPort(database, name, port); err != nil {
+			return nil, fmt.Errorf("reserve port %d: %w", port, err)
 		}
 	}
-
-	// Update SSH config
-	allWs, _ := db.ListWorkspaces(database)
-	var entries []ssh.SSHConfigEntry
-	for _, w := range allWs {
-		entries = append(entries, ssh.SSHConfigEntry{Name: w.Name, Port: w.SSHPort})
-	}
-	if err := ssh.UpdateSSHConfig(entries); err != nil {
+	if err := updateSSHConfig(database); err != nil {
 		fmt.Printf("WARN update ssh config: %v\n", err)
 	}
 
+	success = true
 	fmt.Printf("INFO Workspace %q created (stopped). Use 'devd start %s' to boot.\n", name, name)
+	fmt.Printf("     Disk: %s\n", diskPath)
 	fmt.Printf("     SSH port: %d, Relay port: %d\n", sshPort, relayPort)
-
 	return ws, nil
 }
 

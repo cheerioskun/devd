@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  command -v brew >/dev/null 2>&1 || {
+    echo "ERROR: Homebrew is required on macOS" >&2
+    exit 1
+  }
+  brew tap libkrun/krun
+  brew trust libkrun/krun
+
+  if ! brew list --versions libkrun/krun/libkrunfw >/dev/null 2>&1; then
+    # The tap can infer "64" from the firmware filename and request a missing
+    # bottle. Building this small package avoids that upstream formula issue.
+    brew install --build-from-source libkrun/krun/libkrunfw
+  fi
+  brew install libkrun/krun/libkrun libkrun/krun/buildah e2fsprogs
+
+  echo "Runtime dependencies installed. Run: build"
+elif command -v dnf >/dev/null 2>&1; then
+  sudo dnf install -y buildah e2fsprogs gcc libkrun-devel libkrunfw
+  echo "Runtime dependencies installed. Run: build"
+else
+  echo "Manual installation required: buildah, e2fsprogs, libkrun headers/library, libkrunfw, and a C compiler" >&2
+  exit 1
+fi

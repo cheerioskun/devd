@@ -18,7 +18,7 @@ Use microVMs directly — one per workspace — instead of running containers in
 ┌──────────────────────────────────────────────┐
 │  devd CLI + daemon (Go binary)               │
 │  ────────────────────────────────────────    │
-│  • Shell out to krunvm/crun (VM lifecycle)   │
+│  • Shell out to devd-vm (VM lifecycle)       │
 │  • SSH config + CA manager                   │
 │  • Port proxy (contested ports)              │
 │  • SQLite (workspace metadata)               │
@@ -27,7 +27,7 @@ Use microVMs directly — one per workspace — instead of running containers in
         │
         ├── manages ──► SQLite (~/.devd/devd.db)
         │
-        ├── shells out ──► krunvm / crun
+        ├── shells out ──► devd-vm + libkrun
         │                    │
         │               ┌────┴─────┐
         │               │  microVM │ ×N (one per workspace)
@@ -41,7 +41,7 @@ Use microVMs directly — one per workspace — instead of running containers in
                           (blocks TSI, proxies to active VM)
 ```
 
-devd shells out to krunvm/crun for VM lifecycle. On macOS, libkrun uses Apple's Hypervisor.framework. On Linux, it uses KVM. There is no intermediate VM layer. Each workspace is a first-class microVM on the host.
+devd shells out to its separately linked `devd-vm` runtime companion for VM lifecycle. The Go binary remains CGO-free. On macOS, libkrun uses Apple's Hypervisor.framework; on Linux, it uses KVM. There is no intermediate VM layer. Each workspace is a first-class microVM whose writable root is one raw ext4 disk.
 
 **Networking** uses libkrun's TSI (Transparent Socket Impersonation). Ports bound inside a VM are auto-exposed on the host. For contested ports (multiple workspaces claiming the same port), devd pre-empts them on the host before VMs start. This causes TSI to fall back to real kernel sockets in the guest — preserving loopback — while a host-side proxy routes external traffic to the active workspace via SSH tunnels.
 
@@ -52,8 +52,9 @@ devd shells out to krunvm/crun for VM lifecycle. On macOS, libkrun uses Apple's 
 | Layer | Component | Role |
 |-------|-----------|------|
 | CLI | [cobra](https://github.com/spf13/cobra) | Command parsing |
-| VM runtime | krunvm / crun (shelled out) | MicroVM lifecycle. No CGO. |
-| Filesystem | virtio-fs (built into libkrun) | Host ↔ VM code mount at `/workspace` |
+| VM runtime | `devd-vm` (shelled out) | Thin separately linked libkrun companion; Go remains no-CGO |
+| Guest root | raw ext4 over virtio-blk | One writable cloneable disk per workspace |
+| Host mount | virtio-fs (built into libkrun) | Host ↔ VM code mount at `/workspace` |
 | Networking | libkrun TSI | Transparent socket proxying via vsock |
 | Port proxy | devd daemon (Go, host-side) | Pre-empts contested ports, proxies via SSH tunnels |
 | SSH | Shared Ed25519 keypair | IDE integration, SSH tunnels, `~/.ssh/config` management |
@@ -88,15 +89,31 @@ A CA-based model (per-VM host certificates) is a possible future improvement for
 
 ### Shell out, not CGO
 
-devd shells out to krunvm/crun for VM operations rather than linking libkrun's C API via CGO. This keeps the Go binary simple and cross-compilable. krunvm is a required dependency.
+The Go CLI never links libkrun. It shells out to the separately built and signed `devd-vm` companion, which exposes only the root-disk and one-time conversion operations devd needs. A static Linux `devd-image-helper` performs OCI-to-ext4 copying in a disposable helper VM. The installed bundle is therefore three executables while the main Go binary remains simple, pure Go, and cross-compilable.
+
+krunvm's Buildah-VFS workspace lifecycle is not used. Directory-root mode exists only inside the cold converter so logical OCI ownership, modes, links, xattrs, and capabilities can be recorded into ext4. Every user workspace is ext4-only.
+
+### Digest-addressed ext4 image cache
+
+devd accepts any OCI image but never creates a Buildah container per workspace. On first use it resolves the local image to an immutable digest, exposes that rootfs read-only to a pinned helper VM, and copies Linux metadata into a sparse ext4 image. The completed template is checked, fsynced, and atomically published under:
+
+```text
+~/.devd/images/sha256-<digest>-<arch>-v<format>-<size>/rootfs.ext4
+```
+
+A workspace is one copy-on-write clone at `~/.devd/workspaces/<name>/rootfs.ext4`. macOS requires APFS clonefile and Linux requires a successful reflink; devd does not silently fall back to a full hot-path copy. Templates are immutable and keyed by digest, architecture, disk format version, and logical disk size.
+
+The default sparse capacity is 32 GiB. Physical host space is consumed only by template data and blocks changed by each clone.
 
 ### Image-agnostic, registry-hosted default
 
-devd does not manage or build images. It pulls any OCI image you specify and boots it directly. A small default image (Alpine + Nix, ~50MB) is planned for v0.1.1 — until then, specify any OCI image (e.g. `nicolaka/netshoot`).
+devd resolves any OCI image you specify through Buildah, then boots only its cached ext4 representation. A small default image (Alpine + Nix, ~50MB) remains desirable to reduce first-use conversion and transfer costs.
 
-### Cold migration only
+### Disk fork and cold migration only
 
-Live migration adds enormous complexity for dev workloads that don't need it. Snapshot the filesystem, upload, restore elsewhere. The workspace identity (name, config, port mappings) travels as a JSON sidecar alongside the tarball.
+A stopped workspace forks by reflink-cloning its single ext4 file. The child preserves complete guest disk state but receives fresh ports, machine ID, and SSH host keys on first boot. Host-mounted project files are outside the disk and are reused or explicitly overridden; they are never implicitly copied.
+
+Live migration adds enormous complexity for dev workloads that do not need it. Portable migration exports the ext4 disk plus workspace JSON rather than serializing a host directory tree.
 
 ---
 
@@ -177,7 +194,7 @@ $ devd switch frontend
 | Aspect | macOS | Linux |
 |--------|-------|-------|
 | Hypervisor | Hypervisor.framework | KVM |
-| VM runtime | libkrun (via krunvm) | libkrun (via crun) |
+| VM runtime | libkrun via `devd-vm` | libkrun via `devd-vm` |
 | Networking | TSI | TSI (or pasta — has real netns, loopback works unconditionally) |
 | Port proxy | Same on both | Same on both |
 
@@ -204,13 +221,16 @@ The `image` field is respected as the base OCI image for the workspace. Full dev
 
 ## State: SQLite
 
-SQLite tracks workspace metadata that doesn't live anywhere else. It is an index, not a source of truth — krunvm/crun owns VM state.
+SQLite tracks workspace metadata and process state. The workspace ext4 file owns persistent guest state; PID liveness owns actual running state.
 
 ```sql
 CREATE TABLE workspaces (
     name          TEXT PRIMARY KEY,
     image         TEXT NOT NULL,
-    rootfs_path   TEXT NOT NULL,
+    workspace_dir TEXT NOT NULL,
+    disk_path      TEXT NOT NULL,
+    image_digest   TEXT NOT NULL,
+    parent_name    TEXT NOT NULL DEFAULT '',
     ssh_port      INTEGER NOT NULL UNIQUE,   -- unique sshd port per VM
     relay_port    INTEGER NOT NULL UNIQUE,    -- host-side SSH tunnel relay port
     state         TEXT DEFAULT 'stopped',     -- stopped | running
@@ -242,8 +262,8 @@ Reserved ports are declared in the workspace config (via `forwardPorts` in devco
 
 | Version | Scope | Success Criteria |
 |---------|-------|------------------|
-| **v0.1** | Local lifecycle + switch | `devd run nicolaka/netshoot --name myapp && devd ssh myapp` works. sshd running. VS Code Remote-SSH connects. File mount bidirectional. `devd switch` routes contested ports via proxy. |
-| **v0.2** | Snapshots | `devd snapshot myapp` produces tarball + JSON sidecar. `devd restore` recreates workspace from snapshot. |
+| **v0.1** | Ext4 lifecycle, fork, and switch | `devd run nicolaka/netshoot --name myapp && devd ssh myapp` works; `devd run --name child --fork <stopped-parent>` preserves disk state, creates fresh identity, and boots the child; file mount is bidirectional; `devd switch` routes contested ports. |
+| **v0.2** | Portable snapshots | export/import the ext4 disk plus JSON sidecar. |
 | **v0.3** | Remote storage | `devd snapshot --to s3://...` works. Restore on a fresh machine from S3. |
 | **v0.4** | Remote nodes | `devd new --remote <server>`. Server runs devd in agent mode. SSH/mTLS control plane. |
 | **v0.5** | Migration | `devd move myapp --to <server>`. Snapshot → upload → restore. |
@@ -350,7 +370,7 @@ Verified on macOS ARM64, krunvm 0.2.6, Feb 2026. Six rounds of testing across Ex
 | Host uses `SO_REUSEPORT` on `0.0.0.0:8080` | TSI coexists — connections distributed unpredictably. Don't use. |
 | Two VMs both bind `:8080` (no pre-emption) | Both succeed. First-to-bind wins deterministically. |
 | Kill one VM | Surviving VM takes over (~25ms). |
-| SIGSTOP on krunvm process | No failover. Connections queue and timeout. |
+| SIGSTOP on VMM process | No failover. Connections queue and timeout. |
 | `krun_set_port_map` | Breaks guest loopback. |
 | `ss -tlnp` under normal TSI | Always empty. |
 

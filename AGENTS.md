@@ -7,7 +7,9 @@ devd: microVM-per-workspace dev environments. Go, no CGO. See `README.md` for us
 - Entry point: `cmd/devd/main.go` → `internal/cli/root.go`
 - One file per cobra command in `internal/cli/` (e.g., `create.go`, `ssh.go`, `daemon.go`)
 - `internal/cli/create.go` has `doCreate()` — shared by both `create` and `run` commands
-- `internal/db/db.go` — all queries, migrations, schema in one file
+- `internal/db/db.go` — all queries and schema in one file
+- `internal/storage/storage.go` — digest cache, ext4 templates, reflink cloning
+- `internal/vm/runtime.go` — shells out to the bundled `devd-vm` companion
 - `internal/proxy/proxy.go` — entire proxy daemon in one file
 - `internal/config/config.go` — path constants, defaults
 - Networking design rationale and TSI internals: `SPEC.md`
@@ -31,7 +33,7 @@ Do **not** use `git commit`, `git add`, `git checkout`, `git reset`, or `git sta
 
 ## Hard constraints
 
-1. **No CGO.** Ever. Use `modernc.org/sqlite`, shell out to `krunvm`. Do not link C libraries.
+1. **No CGO in Go.** Ever. Use `modernc.org/sqlite`; shell out to the separately linked `devd-vm` companion. Do not link C libraries into the Go binary.
 2. **No `krun_set_port_map`.** It breaks guest loopback. See `SPEC.md` appendix.
 3. **Daemon must pre-empt contested ports before VMs start.** Ordering matters. See `SPEC.md` networking section.
 4. **gofmt only.** No other formatters. Pre-commit hooks enforce `gofmt`, `govet`, `golangci-lint`.
@@ -44,20 +46,20 @@ Managed via `devenv.nix`. Enter with `devenv shell` or automatically via direnv.
 - **CGO_ENABLED=0** enforced via devenv — no-CGO invariant is automatic
 - **golangci-lint** v2 with project config in `.golangci.yml`
 - **jj** (Jujutsu) and **openssh** provided by devenv — no manual install needed
-- **krunvm** provided by Nix on Linux; on macOS run `install-krunvm` in the devenv shell
+- **Buildah/libkrun/e2fsprogs** provided by Nix on Linux; on macOS run `install-runtime` in the devenv shell
 - **Git hooks** (pre-commit): `gofmt`, `govet`, `golangci-lint` — code must pass all three
 - **`check` script** runs gofmt + vet + lint + test — use before `jj commit` (hooks may not fire reliably via jj)
 - **`devenv test`** runs build, vet, lint, and test — treat failures as blocking
 
 | Command | What |
 |---------|------|
-| `build` | `go build -o bin/devd ./cmd/devd` |
+| `build` | Build `bin/devd`, `bin/devd-vm`, and `bin/devd-image-helper` |
 | `test`  | `go test ./...` |
 | `lint`  | `golangci-lint run ./...` |
 | `check` | gofmt + vet + lint + test (full pre-commit gate) |
 | `setup` | `go mod download` |
 | `clean` | `rm -rf bin/` |
-| `install-krunvm` | Install krunvm (macOS: brew, Fedora: dnf) |
+| `install-runtime` | Install Buildah, e2fsprogs, libkrun, and firmware |
 
 ## Code patterns (match these, don't invent new ones)
 
@@ -84,15 +86,17 @@ defer database.Close()
 
 **CLI flags** — package-level vars, registered in `init()`. Create-specific flags use `create*` prefix; others use `flag*`.
 
-**Process detachment** — background krunvm processes use `Setpgid: true` and `go cmd.Wait()`. Do not wait synchronously.
+**Process detachment** — background `devd-vm` processes use `Setpgid: true` and `go cmd.Wait()`. Do not wait synchronously.
 
 **SSH config** — managed block between `# BEGIN devd-managed` / `# END devd-managed` markers in `~/.ssh/config`. Updated on every create/rm.
 
 ## State model
 
 - SQLite (`~/.devd/devd.db`) owns workspace metadata, port reservations, active workspace flag
-- krunvm owns actual VM state — devd reconciles via PID liveness checks (`vm.IsRunning`)
-- Runtime files live under `~/.devd/workspaces/<name>/` (init script, VM log)
+- One writable `rootfs.ext4` owns each workspace's persistent guest state
+- `devd-vm` process liveness owns actual VM state; devd reconciles with `vm.IsRunning`
+- Runtime files live under `~/.devd/workspaces/<name>/` (ext4 disk, config, VM log)
+- Immutable digest-addressed templates live under `~/.devd/images/`
 - SSH ports start at 2222, relay ports at 9001; both allocated as `MAX(col) + 1`
 
 ## Testing
@@ -100,7 +104,7 @@ defer database.Close()
 No tests exist yet. When adding them:
 - Standard `testing` package, table-driven, files alongside source
 - `db` and `ssh/config.go` are the easiest to unit test (no external deps beyond filesystem)
-- `vm` operations need `krunvm` installed — guard with `testing.Short()` or build tags
+- Full VM/storage integration needs the runtime companion and libkrun — guard with `testing.Short()` or build tags
 
 ## Experiments
 
@@ -121,7 +125,10 @@ The `experiments/` directory contains empirical validation of design decisions �
 | exp8       | Boot time benchmark (median 0.61s) + switch validation (14/14 PASS). Also reveals SSH key auth fix: `chmod 755 /root` needed for netshoot image |
 | exp9       | VM density under memory pressure |
 | exp10      | `krunvm create` bottleneck = `buildah VFS` full copy. Optimization tiers documented (small image → APFS template clone → erofs direct) |
-| exp11      | `devd-vm` C prototype wrapping libkrun directly. 1.2× speedup, archived — not worth complexity until create latency is user-facing |
+| exp11      | `devd-vm` C prototype and directory-clone baseline |
+| exp12      | APFS-cloned ext4 root disks: metadata, identity, isolation, persistence, recovery |
+| exp13      | ext4 guest performance versus directory-root virtio-fs |
+| exp14      | Product ext4 create/run and `run --fork` lifecycle |
 
 ### When to add new experiments
 

@@ -1,0 +1,235 @@
+package cli
+
+import (
+	"database/sql"
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"devd/internal/config"
+	"devd/internal/db"
+	"devd/internal/ssh"
+	"devd/internal/storage"
+	"devd/internal/vm"
+)
+
+func parseMount(value string) (string, string, error) {
+	if value == "" {
+		return "", "", nil
+	}
+	parts := strings.SplitN(value, ":", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", fmt.Errorf("--mount must be host:guest (e.g. .:/workspace)")
+	}
+	host, err := filepath.Abs(parts[0])
+	if err != nil {
+		return "", "", fmt.Errorf("resolve mount host path: %w", err)
+	}
+	host, err = filepath.EvalSymlinks(host)
+	if err != nil {
+		return "", "", fmt.Errorf("resolve mount host path %q: %w", parts[0], err)
+	}
+	info, err := os.Stat(host)
+	if err != nil {
+		return "", "", fmt.Errorf("inspect mount host path: %w", err)
+	}
+	if !info.IsDir() {
+		return "", "", fmt.Errorf("mount host path %q is not a directory", host)
+	}
+
+	guest := filepath.Clean(parts[1])
+	if !filepath.IsAbs(guest) || guest != parts[1] || strings.ContainsAny(guest, "\r\n") {
+		return "", "", fmt.Errorf("mount guest path %q must be a clean absolute path", parts[1])
+	}
+	switch guest {
+	case "/", "/dev", "/proc", "/sys", "/run", "/devd":
+		return "", "", fmt.Errorf("mount guest path %q is reserved", guest)
+	}
+	return host, guest, nil
+}
+
+func startWorkspace(database *sql.DB, ws *db.Workspace) (time.Duration, error) {
+	if ws.DiskPath == "" {
+		return 0, fmt.Errorf("workspace %q has no ext4 disk path", ws.Name)
+	}
+	if info, err := os.Stat(ws.DiskPath); err != nil || !info.Mode().IsRegular() {
+		if err == nil {
+			err = fmt.Errorf("not a regular file")
+		}
+		return 0, fmt.Errorf("workspace disk %s: %w", ws.DiskPath, err)
+	}
+	workspaceCfg, err := storage.ReadWorkspaceConfig(ws.WorkspaceDir)
+	if err != nil {
+		return 0, err
+	}
+	devdDir, err := config.DevdDir()
+	if err != nil {
+		return 0, fmt.Errorf("devd directory: %w", err)
+	}
+
+	mounts := []vm.Mount{{Tag: "devd", HostPath: devdDir}}
+	if workspaceCfg.MountHost != "" {
+		mounts = append(mounts, vm.Mount{Tag: "workspace", HostPath: workspaceCfg.MountHost})
+	}
+	environment := imageEnvironment(workspaceCfg.Environment)
+	environment = append(environment,
+		"HOME=/root",
+		"DEVD_NAME="+ws.Name,
+		"DEVD_SSH_PORT="+strconv.Itoa(ws.SSHPort),
+	)
+	logFile := filepath.Join(ws.WorkspaceDir, "vm.log")
+
+	fmt.Printf("INFO Starting workspace %q...\n", ws.Name)
+	bootStart := time.Now()
+	if err := ensureContestedPortsPreempted(database, ws); err != nil {
+		return 0, fmt.Errorf("start workspace %q: %w", ws.Name, err)
+	}
+	if err := ensurePortAvailable(ws.SSHPort); err != nil {
+		return 0, fmt.Errorf("start workspace %q: %w", ws.Name, err)
+	}
+	pid, err := vm.Start(vm.StartOpts{
+		DiskPath: ws.DiskPath,
+		CPUs:     ws.CPUs,
+		Memory:   ws.Memory,
+		Env:      environment,
+		Mounts:   mounts,
+		Command:  "/usr/local/sbin/devd-init",
+		Workdir:  "/",
+		LogFile:  logFile,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("start VM: %w", err)
+	}
+
+	stopAfterFailure := func() {
+		keyPath, _ := config.PrivateKeyPath()
+		if stopErr := vm.Stop(vm.StopOpts{PID: pid, SSHPort: ws.SSHPort, KeyPath: keyPath}); stopErr != nil {
+			fmt.Printf("WARN stop VM after startup failure: %v\n", stopErr)
+		}
+	}
+	if err := db.SetWorkspaceState(database, ws.Name, "running", pid); err != nil {
+		stopAfterFailure()
+		return 0, fmt.Errorf("update state: %w", err)
+	}
+	if err := db.SetActiveWorkspace(database, ws.Name); err != nil {
+		stopAfterFailure()
+		if stateErr := db.SetWorkspaceState(database, ws.Name, "stopped", 0); stateErr != nil {
+			fmt.Printf("WARN update state after active-workspace failure: %v\n", stateErr)
+		}
+		return 0, fmt.Errorf("set active: %w", err)
+	}
+
+	fmt.Printf("INFO Waiting for SSH on port %d...\n", ws.SSHPort)
+	if err := waitForSSH(ws.SSHPort, pid, 30*time.Second); err != nil {
+		stopAfterFailure()
+		if stateErr := db.SetWorkspaceState(database, ws.Name, "stopped", 0); stateErr != nil {
+			fmt.Printf("WARN update state after startup failure: %v\n", stateErr)
+		}
+		return 0, fmt.Errorf("workspace %q failed to start: %w (check log: %s)", ws.Name, err, logFile)
+	}
+	ws.PID = pid
+	ws.State = "running"
+	return time.Since(bootStart), nil
+}
+
+func imageEnvironment(values []string) []string {
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if strings.HasPrefix(value, "HOME=") || strings.HasPrefix(value, "DEVD_NAME=") || strings.HasPrefix(value, "DEVD_SSH_PORT=") {
+			continue
+		}
+		if strings.ContainsRune(value, '\x00') || !strings.Contains(value, "=") {
+			continue
+		}
+		// Leave room under devd-vm's 64-entry limit for HOME and two instance values.
+		if len(result) == 61 {
+			break
+		}
+		result = append(result, value)
+	}
+	return result
+}
+
+func stopWorkspace(ws *db.Workspace) error {
+	keyPath, err := config.PrivateKeyPath()
+	if err != nil {
+		return err
+	}
+	return vm.Stop(vm.StopOpts{
+		PID:     ws.PID,
+		SSHPort: ws.SSHPort,
+		KeyPath: keyPath,
+	})
+}
+
+func ensureContestedPortsPreempted(database *sql.DB, ws *db.Workspace) error {
+	allContested, err := db.GetAllContestedPorts(database)
+	if err != nil {
+		return fmt.Errorf("read contested ports: %w", err)
+	}
+	reserved, err := db.GetReservedPorts(database, ws.Name)
+	if err != nil {
+		return fmt.Errorf("read workspace ports: %w", err)
+	}
+	contested := make(map[int]bool, len(allContested))
+	for _, port := range allContested {
+		contested[port] = true
+	}
+	for _, port := range reserved {
+		if !contested[port] {
+			continue
+		}
+		listener, listenErr := net.Listen("tcp", net.JoinHostPort("0.0.0.0", strconv.Itoa(port)))
+		if listenErr != nil {
+			continue // already pre-empted before this VM starts
+		}
+		_ = listener.Close()
+		return fmt.Errorf("contested port %d is not pre-empted; start devd daemon before this VM", port)
+	}
+	return nil
+}
+
+func ensurePortAvailable(port int) error {
+	address := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return fmt.Errorf("SSH port %d is already in use: %w", port, err)
+	}
+	if err := listener.Close(); err != nil {
+		return fmt.Errorf("release SSH port %d after availability check: %w", port, err)
+	}
+	return nil
+}
+
+func waitForSSH(port, pid int, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	address := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+	for time.Now().Before(deadline) {
+		if !vm.IsRunning(pid) {
+			return fmt.Errorf("VM process exited before SSH became ready")
+		}
+		connection, err := net.DialTimeout("tcp", address, time.Second)
+		if err == nil {
+			_ = connection.Close()
+			return nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return fmt.Errorf("SSH not ready on port %d after %s", port, timeout)
+}
+
+func updateSSHConfig(database *sql.DB) error {
+	allWorkspaces, err := db.ListWorkspaces(database)
+	if err != nil {
+		return err
+	}
+	entries := make([]ssh.SSHConfigEntry, 0, len(allWorkspaces))
+	for _, workspace := range allWorkspaces {
+		entries = append(entries, ssh.SSHConfigEntry{Name: workspace.Name, Port: workspace.SSHPort})
+	}
+	return ssh.UpdateSSHConfig(entries)
+}

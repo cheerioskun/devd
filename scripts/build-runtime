@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root_dir=$(cd "$(dirname "$0")/.." && pwd)
+out_dir=${1:-"$root_dir/bin"}
+mkdir -p "$out_dir"
+
+case "$(uname -s)" in
+  Darwin)
+    command -v brew >/dev/null 2>&1 || {
+      echo "ERROR: Homebrew is required to locate libkrun; run install-runtime" >&2
+      exit 1
+    }
+    libkrun_prefix=${LIBKRUN_PREFIX:-$(brew --prefix libkrun)}
+    libkrunfw_prefix=${LIBKRUNFW_PREFIX:-$(brew --prefix libkrunfw)}
+    cc -O2 -Wall -Wextra \
+      -I"$libkrun_prefix/include" \
+      "$root_dir/cmd/devd-vm/main.c" \
+      -L"$libkrun_prefix/lib" -lkrun \
+      -Wl,-rpath,"$libkrun_prefix/lib" \
+      -Wl,-rpath,"$libkrunfw_prefix/lib" \
+      -o "$out_dir/devd-vm"
+    codesign --force --sign - \
+      --entitlements "$root_dir/cmd/devd-vm/entitlements.plist" \
+      "$out_dir/devd-vm" >/dev/null
+    ;;
+  Linux)
+    if command -v pkg-config >/dev/null 2>&1 && pkg-config --exists libkrun; then
+      # shellcheck disable=SC2046
+      cc -O2 -Wall -Wextra "$root_dir/cmd/devd-vm/main.c" \
+        $(pkg-config --cflags --libs libkrun) \
+        -o "$out_dir/devd-vm"
+    else
+      cc -O2 -Wall -Wextra "$root_dir/cmd/devd-vm/main.c" -lkrun -o "$out_dir/devd-vm"
+    fi
+    ;;
+  *)
+    echo "ERROR: devd runtime is supported only on macOS and Linux" >&2
+    exit 1
+    ;;
+esac
+
+case "$(uname -m)" in
+  arm64|aarch64) helper_arch=arm64 ;;
+  x86_64|amd64) helper_arch=amd64 ;;
+  *)
+    echo "ERROR: unsupported helper architecture: $(uname -m)" >&2
+    exit 1
+    ;;
+esac
+
+(
+  cd "$root_dir"
+  CGO_ENABLED=0 GOOS=linux GOARCH="$helper_arch" \
+    go build -trimpath -ldflags='-s -w' -o "$out_dir/devd-image-helper" ./cmd/devd-image-helper
+)
+
+echo "Built $out_dir/devd-vm"
+echo "Built $out_dir/devd-image-helper"

@@ -6,13 +6,12 @@ import (
 	"github.com/spf13/cobra"
 
 	"devd/internal/db"
-	"devd/internal/vm"
 )
 
 var stopCmd = &cobra.Command{
 	Use:   "stop <workspace>",
 	Short: "Stop a running workspace VM",
-	Long:  `Stop a running workspace by terminating its krunvm process. Like 'ignite stop'.`,
+	Long:  `Stop a workspace cleanly, with a bounded VMM-kill fallback.`,
 	Args:  cobra.ExactArgs(1),
 	RunE:  runStop,
 }
@@ -38,7 +37,7 @@ func runStop(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("INFO Stopping workspace %q (PID %d)...\n", name, ws.PID)
 
-	if err := vm.Stop(ws.PID); err != nil {
+	if err := stopWorkspace(ws); err != nil {
 		return fmt.Errorf("stop VM: %w", err)
 	}
 

@@ -1,31 +1,23 @@
 /*
  * devd-vm: thin libkrun wrapper for booting microVMs.
  *
- * Replaces krunvm for devd's VM lifecycle. Calls libkrun's C API directly,
- * avoiding buildah/VFS entirely. devd shells out to this binary the same way
- * it currently shells out to krunvm.
+ * Runtime companion for devd. The Go CLI remains CGO-free and shells out to
+ * this separately linked process for libkrun VM lifecycle operations.
  *
- * Two rootfs modes:
- *   --root <dir>    Directory served as root via virtio-fs (like krunvm).
- *                    Use with APFS-cloned template directories for fast create.
- *   --disk <path>   Raw ext4 disk image as root block device.
- *                    Use with APFS-cloned images for ~10ms create.
- *
- * Directory-root mode also accepts one --data-disk. Experiment 12 uses this
- * to populate an empty ext4 image from inside a helper VM, preserving the OCI
- * rootfs metadata as exposed by libkrun's macOS virtio-fs implementation.
+ * User workspaces always use --disk with one writable raw ext4 root. The
+ * --helper-root/--data-disk combination is intentionally limited to devd's
+ * one-time OCI-to-ext4 conversion helper; it is never a workspace backend.
  *
  * Usage:
- *   devd-vm --root /path/to/rootfs --cpus 2 --mem 512 \
+ *   devd-vm --disk /path/to/rootfs.ext4 --cpus 2 --mem 512 \
  *           --virtiofs devd:/home/user/.devd \
  *           --virtiofs ws:/home/user/project \
  *           -- /bin/sh /devd/workspaces/myapp/init.sh
  *
- * The process blocks until the VM exits. devd manages it via PID + signals,
- * identical to how it manages krunvm processes today.
+ * The process blocks until the VM exits. devd manages it via PID + signals.
  *
- * Requires: libkrun (brew install krunvm pulls it in)
- * Build:    make devd-vm  (see Makefile)
+ * Requires: libkrun and libkrunfw
+ * Build:    scripts/build-runtime
  */
 
 #include <stdio.h>
@@ -69,9 +61,9 @@ static void usage(void)
 		"Usage: " PROG " [options] -- <exec-path> [args...]\n"
 		"\n"
 		"Options:\n"
-		"  --root <dir>          Root directory (virtio-fs)\n"
-		"  --disk <path>         Root disk image (raw ext4)\n"
-		"  --data-disk <path>    Data disk image (raw; --root mode only)\n"
+		"  --disk <path>         Workspace root disk (raw ext4)\n"
+		"  --helper-root <dir>   Internal image-conversion helper root\n"
+		"  --data-disk <path>    Internal image-conversion target disk\n"
 		"  --cpus <n>            vCPUs (default: 2)\n"
 		"  --mem <n>             RAM in MiB (default: 512)\n"
 		"  --virtiofs <tag:path> Add virtio-fs mount (max %d, repeatable)\n"
@@ -79,7 +71,7 @@ static void usage(void)
 		"  --workdir <path>      Working directory inside guest\n"
 		"  --log-level <0-5>     libkrun log level (default: 0 = off)\n"
 		"\n"
-		"Exactly one of --root or --disk is required.\n"
+		"Exactly one of --helper-root or --disk is required.\n"
 		"Everything after -- is the exec command.\n"
 		"\n"
 		"A minimal default environment (HOME, PATH, TERM) is always set.\n"
@@ -122,7 +114,7 @@ static bool parse_args(int argc, char **argv, struct vm_config *cfg)
 			i++;
 			break;
 		}
-		if (strcmp(argv[i], "--root") == 0 && i + 1 < argc) {
+		if (strcmp(argv[i], "--helper-root") == 0 && i + 1 < argc) {
 			cfg->root_dir = argv[++i];
 		} else if (strcmp(argv[i], "--disk") == 0 && i + 1 < argc) {
 			cfg->disk_path = argv[++i];
@@ -161,15 +153,15 @@ static bool parse_args(int argc, char **argv, struct vm_config *cfg)
 	}
 
 	if (!cfg->root_dir && !cfg->disk_path) {
-		fprintf(stderr, PROG ": one of --root or --disk is required\n");
+		fprintf(stderr, PROG ": one of --helper-root or --disk is required\n");
 		return false;
 	}
 	if (cfg->root_dir && cfg->disk_path) {
-		fprintf(stderr, PROG ": --root and --disk are mutually exclusive\n");
+		fprintf(stderr, PROG ": --helper-root and --disk are mutually exclusive\n");
 		return false;
 	}
-	if (cfg->data_disk_path && !cfg->root_dir) {
-		fprintf(stderr, PROG ": --data-disk is only supported with --root\n");
+	if ((cfg->data_disk_path != NULL) != (cfg->root_dir != NULL)) {
+		fprintf(stderr, PROG ": --helper-root and --data-disk must be used together\n");
 		return false;
 	}
 	if (i >= argc) {
@@ -190,6 +182,17 @@ static bool parse_args(int argc, char **argv, struct vm_config *cfg)
 		return 1; \
 	} \
 } while (0)
+
+static bool env_has_key(const struct vm_config *cfg, const char *key)
+{
+	size_t key_len = strlen(key);
+	for (int i = 0; i < cfg->env_count; i++) {
+		if (strncmp(cfg->env[i], key, key_len) == 0 &&
+		    cfg->env[i][key_len] == '=')
+			return true;
+	}
+	return false;
+}
 
 int main(int argc, char **argv)
 {
@@ -216,15 +219,19 @@ int main(int argc, char **argv)
 		KRUN_CHECK(krun_set_root(ctx_id, cfg.root_dir),
 			   "krun_set_root");
 	} else {
-		KRUN_CHECK(krun_add_disk(ctx_id, "root", cfg.disk_path, false),
-			   "krun_add_disk(root)");
+		KRUN_CHECK(krun_add_disk3(ctx_id, "root", cfg.disk_path,
+				      KRUN_DISK_FORMAT_RAW, false, false,
+				      KRUN_SYNC_RELAXED),
+			   "krun_add_disk3(root)");
 		KRUN_CHECK(krun_set_root_disk_remount(ctx_id, "/dev/vda", "ext4", NULL),
 			   "krun_set_root_disk_remount");
 	}
 
 	if (cfg.data_disk_path) {
-		KRUN_CHECK(krun_add_disk(ctx_id, "data", cfg.data_disk_path, false),
-			   "krun_add_disk");
+		KRUN_CHECK(krun_add_disk3(ctx_id, "data", cfg.data_disk_path,
+				      KRUN_DISK_FORMAT_RAW, false, false,
+				      KRUN_SYNC_RELAXED),
+			   "krun_add_disk3(data)");
 	}
 
 	for (int i = 0; i < cfg.fs_count; i++) {
@@ -242,9 +249,12 @@ int main(int argc, char **argv)
 	 */
 	const char *envp[MAX_ENV + 4];
 	int ei = 0;
-	envp[ei++] = "HOME=/root";
-	envp[ei++] = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-	envp[ei++] = "TERM=xterm-256color";
+	if (!env_has_key(&cfg, "HOME"))
+		envp[ei++] = "HOME=/root";
+	if (!env_has_key(&cfg, "PATH"))
+		envp[ei++] = "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+	if (!env_has_key(&cfg, "TERM"))
+		envp[ei++] = "TERM=xterm-256color";
 	for (int i = 0; i < cfg.env_count && ei < MAX_ENV + 3; i++)
 		envp[ei++] = cfg.env[i];
 	envp[ei] = NULL;

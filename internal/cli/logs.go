@@ -7,8 +7,8 @@ import (
 	"os/exec"
 	"path/filepath"
 
-	"github.com/spf13/cobra"
 	"devd/internal/config"
+	"github.com/spf13/cobra"
 )
 
 var followLogs bool
@@ -43,7 +43,7 @@ var logsCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("open log file: %w", err)
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 
 		_, err = io.Copy(os.Stdout, f)
 		return err
