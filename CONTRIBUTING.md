@@ -3,7 +3,7 @@
 ## Prerequisites
 
 - macOS (Apple Silicon) or Linux
-- [krunvm](https://github.com/containers/krunvm) — provided by Nix on Linux; on macOS run `install-krunvm` inside the devenv shell
+- Buildah, e2fsprogs, libkrun, and libkrunfw — provided by Nix on Linux; on macOS run `install-runtime` inside the devenv shell
 
 ## Dev Environment Setup
 
@@ -24,13 +24,13 @@ Inside the devenv shell:
 
 | Command | What it does |
 |---------|--------------|
-| `build` | `go build -o bin/devd ./cmd/devd` |
+| `build` | Build `bin/devd`, `bin/devd-vm`, and `bin/devd-image-helper` |
 | `test`  | `go test ./...` |
 | `lint`  | `golangci-lint run` |
 | `check` | gofmt + vet + lint + test (use before `jj commit`) |
 | `setup` | `go mod download` |
 | `clean` | Remove `bin/` |
-| `install-krunvm` | Install krunvm (macOS: brew, Fedora: dnf) |
+| `install-runtime` | Install Buildah, e2fsprogs, libkrun, and firmware |
 
 ## Project Structure
 
@@ -39,7 +39,10 @@ cmd/devd/          CLI entrypoint (cobra)
 internal/
   cli/             Command implementations
   db/              SQLite state layer
-  vm/              krunvm wrapper (create/start/stop/delete)
+  storage/         OCI-to-ext4 cache and reflink clone lifecycle
+  vm/              devd-vm wrapper and generic guest init
+cmd/devd-vm/       separately linked libkrun companion
+cmd/devd-image-helper/ static Linux metadata-preserving copy helper
   ssh/             CA, certificates, ~/.ssh/config management
   proxy/           Port pre-emption and proxy daemon (Phase 1b)
   config/          devcontainer.json parsing
@@ -63,7 +66,8 @@ The `check` script runs the same validations as the git hooks plus `go test`.
 
 - `gofmt` is the formatter. No exceptions.
 - Keep packages small and focused. One responsibility per package.
-- Shell out to `krunvm`/`crun` for VM operations. No CGO.
+- Keep the Go CLI CGO-free. Shell out to the bundled `devd-vm` companion for VM operations.
+- User workspaces are ext4-only. Directory-root mode is confined to one-time image conversion.
 - Use `modernc.org/sqlite` for the database (pure Go, no CGO).
 
 ## Testing

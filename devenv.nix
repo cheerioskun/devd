@@ -8,8 +8,12 @@
     pkgs.golangci-lint
     pkgs.jujutsu
     pkgs.openssh
+    pkgs.pkg-config
   ] ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [
-    pkgs.krunvm
+    pkgs.buildah
+    pkgs.libkrun
+    pkgs.libkrunfw
+    pkgs.stdenv.cc
   ];
 
   # https://devenv.sh/languages/
@@ -23,8 +27,9 @@
   # https://devenv.sh/scripts/
   scripts.build.exec = ''
     set -euo pipefail
-    echo "Building devd..."
+    echo "Building devd and runtime companions..."
     go build -o bin/devd ./cmd/devd
+    scripts/build-runtime bin
     echo "Built bin/devd"
   '';
 
@@ -107,8 +112,8 @@
     echo "Done. Use: jj st, jj log -r 'all()'"
   '';
 
-  scripts.install-krunvm.exec = ''
-    exec "${config.env.DEVENV_ROOT}/scripts/install-krunvm" "$@"
+  scripts.install-runtime.exec = ''
+    exec "${config.env.DEVENV_ROOT}/scripts/install-runtime" "$@"
   '';
 
   # https://devenv.sh/basics/
@@ -121,7 +126,7 @@
     echo "  setup  \u2014 go mod download"
     echo "  setup-jj \u2014 initialize jj after a plain git clone"
     echo "  clean  \u2014 rm -rf bin/"
-    echo "  install-krunvm \u2014 install krunvm (macOS: brew, Fedora: dnf)"
+    echo "  install-runtime \u2014 install buildah, e2fsprogs, libkrun, and firmware"
     echo ""
     go version
     jj version 2>/dev/null || true
@@ -131,13 +136,10 @@
       echo "INFO this repo uses jj. Run: setup-jj"
     fi
 
-    # Warn if krunvm is not installed (provided by Nix on Linux, manual on macOS)
-    if ! command -v krunvm &>/dev/null; then
+    if ! command -v buildah &>/dev/null || ! command -v mke2fs &>/dev/null; then
       echo ""
-      echo "WARNING: krunvm not found."
-      echo "  devd shells out to krunvm for VM lifecycle."
-      echo "  Run: install-krunvm"
-      echo "  See: https://github.com/containers/krunvm"
+      echo "WARNING: devd runtime dependencies are incomplete."
+      echo "  Run: install-runtime"
     fi
 
     # Pre-fetch modules on first entry if go.sum exists but module cache is cold
@@ -153,6 +155,7 @@
     echo "Running enterTest..."
     go version
     go build ./cmd/devd
+    scripts/build-runtime bin
     go vet ./...
     go test ./...
     golangci-lint run ./...

@@ -62,7 +62,7 @@ func main() {
 	if err := os.MkdirAll(*dir, 0o755); err != nil {
 		fatal("create benchmark directory", err)
 	}
-	defer os.RemoveAll(*dir)
+	defer func() { _ = os.RemoveAll(*dir) }()
 
 	result := results{
 		Mode:      *mode,
@@ -245,7 +245,7 @@ func main() {
 }
 
 func dropCaches() bool {
-	syscall.Sync()
+	_ = syscall.Sync()
 	return os.WriteFile("/proc/sys/vm/drop_caches", []byte("3\n"), 0o200) == nil
 }
 

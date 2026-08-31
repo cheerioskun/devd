@@ -22,11 +22,14 @@ type SSHConfigEntry struct {
 
 // UpdateSSHConfig rewrites the devd-managed block in ~/.ssh/config.
 func UpdateSSHConfig(entries []SSHConfigEntry) error {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return err
+	sshConfigPath := os.Getenv("DEVD_SSH_CONFIG")
+	if sshConfigPath == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return err
+		}
+		sshConfigPath = filepath.Join(home, ".ssh", "config")
 	}
-	sshConfigPath := filepath.Join(home, ".ssh", "config")
 
 	privKeyPath, err := config.PrivateKeyPath()
 	if err != nil {
@@ -37,11 +40,11 @@ func UpdateSSHConfig(entries []SSHConfigEntry) error {
 	var block strings.Builder
 	block.WriteString(beginMarker + "\n")
 	for _, e := range entries {
-		block.WriteString(fmt.Sprintf("Host devd-%s\n", e.Name))
+		fmt.Fprintf(&block, "Host devd-%s\n", e.Name)
 		block.WriteString("    HostName 127.0.0.1\n")
-		block.WriteString(fmt.Sprintf("    Port %d\n", e.Port))
+		fmt.Fprintf(&block, "    Port %d\n", e.Port)
 		block.WriteString("    User root\n")
-		block.WriteString(fmt.Sprintf("    IdentityFile %s\n", privKeyPath))
+		fmt.Fprintf(&block, "    IdentityFile %s\n", privKeyPath)
 		block.WriteString("    StrictHostKeyChecking no\n")
 		block.WriteString("    UserKnownHostsFile /dev/null\n")
 		block.WriteString("    LogLevel ERROR\n")
