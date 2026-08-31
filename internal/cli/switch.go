@@ -11,9 +11,9 @@ import (
 var switchCmd = &cobra.Command{
 	Use:   "switch <workspace>",
 	Short: "Switch the active workspace",
-	Long: `Switch which workspace receives traffic on contested ports.
-The proxy daemon (devd daemon) routes new connections to the active workspace.
-Both VMs keep running — no processes are killed or restarted.`,
+	Long: `Switch which workspace receives traffic on shared declared ports.
+New connections route to the selected workspace. Running VMs and guest
+processes are not interrupted.`,
 	Args: cobra.ExactArgs(1),
 	RunE: runSwitch,
 }
@@ -56,8 +56,7 @@ func runSwitch(cmd *cobra.Command, args []string) error {
 	// Report contested ports
 	contested, _ := db.GetContestedPorts(database)
 	if len(contested) > 0 {
-		fmt.Printf("INFO Contested ports %v now route to %q\n", contested, name)
-		fmt.Println("INFO (ensure 'devd daemon' is running for proxy to take effect)")
+		fmt.Printf("INFO Shared ports %v now route to %q\n", contested, name)
 	}
 
 	return nil

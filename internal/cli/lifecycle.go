@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -16,6 +17,20 @@ import (
 	"devd/internal/storage"
 	"devd/internal/vm"
 )
+
+func validatePorts(ports []int) error {
+	seen := make(map[int]bool, len(ports))
+	for _, port := range ports {
+		if port < 1 || port > 65535 {
+			return fmt.Errorf("port %d must be between 1 and 65535", port)
+		}
+		if seen[port] {
+			return fmt.Errorf("port %d was declared more than once", port)
+		}
+		seen[port] = true
+	}
+	return nil
+}
 
 func parseMount(value string) (string, string, error) {
 	if value == "" {
@@ -83,11 +98,16 @@ func startWorkspace(database *sql.DB, ws *db.Workspace) (time.Duration, error) {
 	)
 	logFile := filepath.Join(ws.WorkspaceDir, "vm.log")
 
-	fmt.Printf("INFO Starting workspace %q...\n", ws.Name)
-	bootStart := time.Now()
-	if err := ensureContestedPortsPreempted(database, ws); err != nil {
+	reservedPorts, err := db.GetReservedPorts(database, ws.Name)
+	if err != nil {
+		return 0, fmt.Errorf("read declared ports: %w", err)
+	}
+	if err := ensureProxyDaemon(reservedPorts); err != nil {
 		return 0, fmt.Errorf("start workspace %q: %w", ws.Name, err)
 	}
+
+	fmt.Printf("INFO Starting workspace %q...\n", ws.Name)
+	bootStart := time.Now()
 	if err := ensurePortAvailable(ws.SSHPort); err != nil {
 		return 0, fmt.Errorf("start workspace %q: %w", ws.Name, err)
 	}
@@ -166,35 +186,22 @@ func stopWorkspace(ws *db.Workspace) error {
 	})
 }
 
-func ensureContestedPortsPreempted(database *sql.DB, ws *db.Workspace) error {
-	allContested, err := db.GetAllContestedPorts(database)
+func nextAvailableSSHPort(database *sql.DB) (int, error) {
+	port, err := db.NextSSHPort(database)
 	if err != nil {
-		return fmt.Errorf("read contested ports: %w", err)
+		return 0, err
 	}
-	reserved, err := db.GetReservedPorts(database, ws.Name)
-	if err != nil {
-		return fmt.Errorf("read workspace ports: %w", err)
-	}
-	contested := make(map[int]bool, len(allContested))
-	for _, port := range allContested {
-		contested[port] = true
-	}
-	for _, port := range reserved {
-		if !contested[port] {
-			continue
+	start := port
+	for ; port <= 65535; port++ {
+		if err := ensurePortAvailable(port); err == nil {
+			return port, nil
 		}
-		listener, listenErr := net.Listen("tcp", net.JoinHostPort("0.0.0.0", strconv.Itoa(port)))
-		if listenErr != nil {
-			continue // already pre-empted before this VM starts
-		}
-		_ = listener.Close()
-		return fmt.Errorf("contested port %d is not pre-empted; start devd daemon before this VM", port)
 	}
-	return nil
+	return 0, fmt.Errorf("no SSH ports are available at or above %d", start)
 }
 
 func ensurePortAvailable(port int) error {
-	address := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+	address := net.JoinHostPort("0.0.0.0", strconv.Itoa(port))
 	listener, err := net.Listen("tcp", address)
 	if err != nil {
 		return fmt.Errorf("SSH port %d is already in use: %w", port, err)
@@ -206,18 +213,31 @@ func ensurePortAvailable(port int) error {
 }
 
 func waitForSSH(port, pid int, timeout time.Duration) error {
+	keyPath, err := config.PrivateKeyPath()
+	if err != nil {
+		return err
+	}
 	deadline := time.Now().Add(timeout)
-	address := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
 	for time.Now().Before(deadline) {
 		if !vm.IsRunning(pid) {
 			return fmt.Errorf("VM process exited before SSH became ready")
 		}
-		connection, err := net.DialTimeout("tcp", address, time.Second)
-		if err == nil {
-			_ = connection.Close()
+		sshCheck := exec.Command("ssh",
+			"-o", "BatchMode=yes",
+			"-o", "StrictHostKeyChecking=no",
+			"-o", "UserKnownHostsFile=/dev/null",
+			"-o", "LogLevel=ERROR",
+			"-o", "ConnectTimeout=1",
+			"-o", "ConnectionAttempts=1",
+			"-i", keyPath,
+			"-p", strconv.Itoa(port),
+			"root@127.0.0.1",
+			"true",
+		)
+		if err := sshCheck.Run(); err == nil {
 			return nil
 		}
-		time.Sleep(200 * time.Millisecond)
+		time.Sleep(100 * time.Millisecond)
 	}
 	return fmt.Errorf("SSH not ready on port %d after %s", port, timeout)
 }

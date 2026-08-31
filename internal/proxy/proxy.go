@@ -1,13 +1,19 @@
 package proxy
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -16,24 +22,31 @@ import (
 	"devd/internal/db"
 )
 
-// Proxy manages TCP proxying for contested ports and SSH tunnel lifecycle.
+// Proxy owns declared host ports and forwards connections through OpenSSH
+// stream-local tunnels to the selected workspace. Owning every declared port
+// before a VM starts keeps TSI behavior stable if the port later becomes
+// shared by another workspace.
 type Proxy struct {
-	db        *sql.DB
-	listeners map[int]net.Listener // contested port → listener
-	tunnels   map[string]*Tunnel   // "workspace:port" → SSH tunnel
+	db *sql.DB
+
 	mu        sync.Mutex
+	listeners map[int]net.Listener
+	tunnels   map[string]*Tunnel
 	stopCh    chan struct{}
+	stopOnce  sync.Once
 }
 
-// Tunnel represents an SSH port-forwarding tunnel.
+// Tunnel is one host Unix socket forwarded to a guest loopback port.
 type Tunnel struct {
-	LocalPort  int // relay port on host
-	RemotePort int // contested port inside guest
-	SSHPort    int // guest sshd port (TSI-exposed)
-	Cmd        *exec.Cmd
+	Workspace string
+	Port      int
+	Path      string
+	Cmd       *exec.Cmd
+	Ready     chan struct{}
+	Err       error
 }
 
-// New creates a new Proxy.
+// New creates a proxy using the supplied database for routing decisions.
 func New(database *sql.DB) *Proxy {
 	return &Proxy{
 		db:        database,
@@ -43,172 +56,338 @@ func New(database *sql.DB) *Proxy {
 	}
 }
 
-// PreemptPorts binds the given ports on 0.0.0.0 BEFORE any VMs start.
-// This blocks TSI from grabbing them, forcing guests to fall back to
-// real kernel sockets (see experiments 4-6).
-func (p *Proxy) PreemptPorts(ports []int) error {
+// EnsurePorts synchronously pre-empts the supplied ports. It returns only
+// after every port is owned, which lets the caller safely start a VM.
+func (p *Proxy) EnsurePorts(ports []int) error {
+	var errs []error
 	for _, port := range ports {
-		if err := p.listen(port); err != nil {
-			return fmt.Errorf("pre-empt :%d: %w", port, err)
+		if err := p.ensurePort(port); err != nil {
+			errs = append(errs, fmt.Errorf("pre-empt :%d: %w", port, err))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
-// PollTunnels periodically scans the DB for running workspaces and sets up
-// SSH tunnels to any that are new. Call this in a goroutine after pre-emption.
-func (p *Proxy) PollTunnels(contestedPorts []int) {
-	for {
-		select {
-		case <-p.stopCh:
-			return
-		case <-time.After(2 * time.Second):
-		}
-
-		for _, port := range contestedPorts {
-			workspaces, err := db.GetRunningWorkspacesForPort(p.db, port)
-			if err != nil {
-				continue
-			}
-			for _, ws := range workspaces {
-				p.ensureTunnel(ws, port)
-			}
-		}
-	}
-}
-
-func (p *Proxy) ensureTunnel(ws *db.Workspace, contestedPort int) {
-	key := fmt.Sprintf("%s:%d", ws.Name, contestedPort)
-	p.mu.Lock()
-	if _, exists := p.tunnels[key]; exists {
-		p.mu.Unlock()
-		return
-	}
-	p.mu.Unlock()
-
-	// Verify SSH is reachable before setting up tunnel
-	addr := fmt.Sprintf("127.0.0.1:%d", ws.SSHPort)
-	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
-	if err != nil {
-		return // VM not ready yet, will retry next poll
-	}
-	conn.Close()
-
-	keyPath, err := config.PrivateKeyPath()
-	if err != nil {
-		log.Printf("PROXY: ssh key path: %v", err)
-		return
-	}
-
-	cmd := exec.Command("ssh",
-		"-N",
-		"-o", "StrictHostKeyChecking=no",
-		"-o", "UserKnownHostsFile=/dev/null",
-		"-o", "LogLevel=ERROR",
-		"-o", "ExitOnForwardFailure=yes",
-		"-i", keyPath,
-		"-L", fmt.Sprintf("%d:127.0.0.1:%d", ws.RelayPort, contestedPort),
-		"root@127.0.0.1",
-		"-p", strconv.Itoa(ws.SSHPort),
-	)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
-	if err := cmd.Start(); err != nil {
-		log.Printf("PROXY: tunnel %s failed to start: %v", key, err)
-		return
-	}
-	go cmd.Wait()
-
-	tunnel := &Tunnel{
-		LocalPort:  ws.RelayPort,
-		RemotePort: contestedPort,
-		SSHPort:    ws.SSHPort,
-		Cmd:        cmd,
+// ReconcilePorts makes the proxy own exactly the supplied set of ports.
+func (p *Proxy) ReconcilePorts(ports []int) error {
+	desired := make(map[int]bool, len(ports))
+	for _, port := range ports {
+		desired[port] = true
 	}
 
 	p.mu.Lock()
-	p.tunnels[key] = tunnel
+	for port, listener := range p.listeners {
+		if desired[port] {
+			continue
+		}
+		delete(p.listeners, port)
+		_ = listener.Close()
+		log.Printf("PROXY: released 0.0.0.0:%d", port)
+	}
+	for key, tunnel := range p.tunnels {
+		if desired[tunnel.Port] {
+			continue
+		}
+		delete(p.tunnels, key)
+		if tunnel.Cmd != nil && tunnel.Cmd.Process != nil {
+			_ = tunnel.Cmd.Process.Signal(syscall.SIGTERM)
+		}
+		_ = os.Remove(tunnel.Path)
+	}
 	p.mu.Unlock()
 
-	log.Printf("PROXY: tunnel UP — %s — localhost:%d → ssh:%d → VM localhost:%d",
-		ws.Name, ws.RelayPort, ws.SSHPort, contestedPort)
+	return p.EnsurePorts(ports)
 }
 
-func (p *Proxy) listen(port int) error {
-	addr := fmt.Sprintf("0.0.0.0:%d", port)
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return fmt.Errorf("bind %s: %w", addr, err)
+func (p *Proxy) ensurePort(port int) error {
+	if port < 1 || port > 65535 {
+		return fmt.Errorf("invalid TCP port")
 	}
-	p.listeners[port] = ln
-	log.Printf("PROXY: pre-empted 0.0.0.0:%d (TSI will fall back to real sockets)", port)
 
-	go p.acceptLoop(ln, port)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, exists := p.listeners[port]; exists {
+		return nil
+	}
+
+	address := net.JoinHostPort("0.0.0.0", strconv.Itoa(port))
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return fmt.Errorf("bind %s: %w", address, err)
+	}
+	p.listeners[port] = listener
+	log.Printf("PROXY: managing 0.0.0.0:%d", port)
+	go p.acceptLoop(listener, port)
 	return nil
 }
 
-func (p *Proxy) acceptLoop(ln net.Listener, contestedPort int) {
+func (p *Proxy) acceptLoop(listener net.Listener, port int) {
 	for {
-		conn, err := ln.Accept()
+		connection, err := listener.Accept()
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
 			select {
 			case <-p.stopCh:
 				return
 			default:
-				log.Printf("PROXY: accept on :%d: %v", contestedPort, err)
+				log.Printf("PROXY: accept on :%d: %v", port, err)
 				return
 			}
 		}
-		go p.handleConn(conn, contestedPort)
+		go p.handleConnection(connection, port)
 	}
 }
 
-func (p *Proxy) handleConn(client net.Conn, contestedPort int) {
+func (p *Proxy) handleConnection(client net.Conn, port int) {
 	defer client.Close()
 
-	active, err := db.GetActiveWorkspace(p.db)
-	if err != nil || active == nil {
-		log.Printf("PROXY: no active workspace for :%d", contestedPort)
+	target, err := p.targetForPort(port)
+	if err != nil {
+		log.Printf("PROXY: route :%d: %v", port, err)
 		return
 	}
 
-	target := fmt.Sprintf("127.0.0.1:%d", active.RelayPort)
-	upstream, err := net.DialTimeout("tcp", target, 5*time.Second)
+	var upstream net.Conn
+	for attempt := 0; attempt < 2; attempt++ {
+		tunnel, tunnelErr := p.ensureTunnel(target, port)
+		if tunnelErr != nil {
+			err = tunnelErr
+			break
+		}
+		upstream, err = net.DialTimeout("unix", tunnel.Path, 5*time.Second)
+		if err == nil {
+			break
+		}
+		p.dropTunnel(tunnel)
+	}
 	if err != nil {
-		log.Printf("PROXY: connect to %s (%s): %v", target, active.Name, err)
+		log.Printf("PROXY: connect :%d to %s: %v", port, target.Name, err)
 		return
 	}
 	defer upstream.Close()
 
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		io.Copy(upstream, client)
-	}()
-	go func() {
-		defer wg.Done()
-		io.Copy(client, upstream)
-	}()
-	wg.Wait()
+	done := make(chan struct{}, 2)
+	go copyConnection(upstream, client, done)
+	go copyConnection(client, upstream, done)
+	<-done
+	<-done
 }
 
-// Stop tears down all tunnels and listeners.
+func copyConnection(destination, source net.Conn, done chan<- struct{}) {
+	_, _ = io.Copy(destination, source)
+	if closeWriter, ok := destination.(interface{ CloseWrite() error }); ok {
+		_ = closeWriter.CloseWrite()
+	}
+	done <- struct{}{}
+}
+
+func (p *Proxy) targetForPort(port int) (*db.Workspace, error) {
+	workspaces, err := db.GetRunningWorkspacesForPort(p.db, port)
+	if err != nil {
+		return nil, err
+	}
+	for _, workspace := range workspaces {
+		if workspace.IsActive {
+			return workspace, nil
+		}
+	}
+	if len(workspaces) == 1 {
+		return workspaces[0], nil
+	}
+	if len(workspaces) == 0 {
+		return nil, fmt.Errorf("no running workspace declares this port")
+	}
+	return nil, fmt.Errorf("multiple workspaces declare this port but none is active")
+}
+
+func (p *Proxy) ensureTunnel(workspace *db.Workspace, port int) (*Tunnel, error) {
+	key := tunnelKey(workspace.Name, port)
+	p.mu.Lock()
+	if tunnel := p.tunnels[key]; tunnel != nil {
+		p.mu.Unlock()
+		<-tunnel.Ready
+		return tunnel, tunnel.Err
+	}
+
+	path, err := tunnelPath(key)
+	if err != nil {
+		p.mu.Unlock()
+		return nil, err
+	}
+	tunnel := &Tunnel{
+		Workspace: workspace.Name,
+		Port:      port,
+		Path:      path,
+		Ready:     make(chan struct{}),
+	}
+	p.tunnels[key] = tunnel
+	p.mu.Unlock()
+
+	go p.startTunnel(key, tunnel, workspace)
+	<-tunnel.Ready
+	return tunnel, tunnel.Err
+}
+
+func (p *Proxy) startTunnel(key string, tunnel *Tunnel, workspace *db.Workspace) {
+	_ = os.Remove(tunnel.Path)
+	keyPath, err := config.PrivateKeyPath()
+	if err != nil {
+		p.finishTunnelStart(key, tunnel, err)
+		return
+	}
+
+	forward := fmt.Sprintf("%s:127.0.0.1:%d", tunnel.Path, tunnel.Port)
+	command := exec.Command("ssh",
+		"-N",
+		"-o", "BatchMode=yes",
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "UserKnownHostsFile=/dev/null",
+		"-o", "LogLevel=ERROR",
+		"-o", "ExitOnForwardFailure=yes",
+		"-o", "StreamLocalBindUnlink=yes",
+		"-o", "ServerAliveInterval=15",
+		"-o", "ServerAliveCountMax=2",
+		"-i", keyPath,
+		"-p", strconv.Itoa(workspace.SSHPort),
+		"-L", forward,
+		"root@127.0.0.1",
+	)
+	var stderr bytes.Buffer
+	command.Stdin = nil
+	command.Stderr = &stderr
+	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := command.Start(); err != nil {
+		p.finishTunnelStart(key, tunnel, fmt.Errorf("start SSH tunnel: %w", err))
+		return
+	}
+
+	p.mu.Lock()
+	tunnel.Cmd = command
+	p.mu.Unlock()
+	wait := make(chan error, 1)
+	go func() { wait <- command.Wait() }()
+
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	timeout := time.NewTimer(5 * time.Second)
+	defer timeout.Stop()
+	for {
+		select {
+		case err := <-wait:
+			p.finishTunnelStart(key, tunnel, tunnelExitError("SSH tunnel exited before ready", err, stderr.String()))
+			return
+		case <-ticker.C:
+			if info, err := os.Stat(tunnel.Path); err == nil && info.Mode()&os.ModeSocket != 0 {
+				p.finishTunnelStart(key, tunnel, nil)
+				log.Printf("PROXY: tunnel UP — %s :%d", workspace.Name, tunnel.Port)
+				err := <-wait
+				p.removeTunnel(key, tunnel)
+				if err != nil {
+					log.Printf("PROXY: tunnel DOWN — %s :%d: %v", workspace.Name, tunnel.Port, tunnelExitError("SSH tunnel exited", err, stderr.String()))
+				}
+				return
+			}
+		case <-timeout.C:
+			_ = command.Process.Signal(syscall.SIGTERM)
+			p.finishTunnelStart(key, tunnel, fmt.Errorf("SSH tunnel was not ready after 5s"))
+			return
+		case <-p.stopCh:
+			_ = command.Process.Signal(syscall.SIGTERM)
+			p.finishTunnelStart(key, tunnel, fmt.Errorf("proxy stopped"))
+			return
+		}
+	}
+}
+
+func tunnelExitError(message string, err error, stderr string) error {
+	stderr = strings.TrimSpace(stderr)
+	if err == nil && stderr == "" {
+		return fmt.Errorf("%s", message)
+	}
+	if err == nil {
+		return fmt.Errorf("%s: %s", message, stderr)
+	}
+	if stderr == "" {
+		return fmt.Errorf("%s: %w", message, err)
+	}
+	return fmt.Errorf("%s: %w: %s", message, err, stderr)
+}
+
+func (p *Proxy) finishTunnelStart(key string, tunnel *Tunnel, err error) {
+	p.mu.Lock()
+	if err != nil && p.tunnels[key] == tunnel {
+		delete(p.tunnels, key)
+	}
+	tunnel.Err = err
+	close(tunnel.Ready)
+	p.mu.Unlock()
+	if err != nil {
+		_ = os.Remove(tunnel.Path)
+	}
+}
+
+func (p *Proxy) dropTunnel(tunnel *Tunnel) {
+	key := tunnelKey(tunnel.Workspace, tunnel.Port)
+	p.mu.Lock()
+	if p.tunnels[key] == tunnel {
+		delete(p.tunnels, key)
+	}
+	p.mu.Unlock()
+	if tunnel.Cmd != nil && tunnel.Cmd.Process != nil {
+		_ = tunnel.Cmd.Process.Signal(syscall.SIGTERM)
+	}
+	_ = os.Remove(tunnel.Path)
+}
+
+func (p *Proxy) removeTunnel(key string, tunnel *Tunnel) {
+	p.mu.Lock()
+	if p.tunnels[key] == tunnel {
+		delete(p.tunnels, key)
+	}
+	p.mu.Unlock()
+	_ = os.Remove(tunnel.Path)
+}
+
+func tunnelKey(workspace string, port int) string {
+	return workspace + ":" + strconv.Itoa(port)
+}
+
+func tunnelPath(key string) (string, error) {
+	devdDir, err := config.DevdDir()
+	if err != nil {
+		return "", err
+	}
+	// Unix socket paths are limited to roughly 104 bytes on macOS. DEVD_DIR is
+	// often beneath a long per-user TMPDIR in tests, so sockets use a short,
+	// user-private /tmp directory and include the state directory in their hash.
+	dir := filepath.Join("/tmp", fmt.Sprintf("devd-%d", os.Getuid()))
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", fmt.Errorf("create tunnel directory: %w", err)
+	}
+	if err := os.Chmod(dir, 0700); err != nil {
+		return "", fmt.Errorf("secure tunnel directory: %w", err)
+	}
+	digest := sha256.Sum256([]byte(devdDir + "\x00" + key))
+	return filepath.Join(dir, fmt.Sprintf("%x.sock", digest[:8])), nil
+}
+
+// Stop releases all managed ports and SSH tunnels.
 func (p *Proxy) Stop() {
-	close(p.stopCh)
+	p.stopOnce.Do(func() { close(p.stopCh) })
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
-
-	for key, t := range p.tunnels {
-		if t.Cmd.Process != nil {
-			t.Cmd.Process.Signal(syscall.SIGTERM)
-		}
-		delete(p.tunnels, key)
-	}
-
-	for port, ln := range p.listeners {
-		ln.Close()
+	for port, listener := range p.listeners {
+		_ = listener.Close()
 		delete(p.listeners, port)
+	}
+	for key, tunnel := range p.tunnels {
+		if tunnel.Cmd != nil && tunnel.Cmd.Process != nil {
+			_ = tunnel.Cmd.Process.Signal(syscall.SIGTERM)
+		}
+		_ = os.Remove(tunnel.Path)
+		delete(p.tunnels, key)
 	}
 }

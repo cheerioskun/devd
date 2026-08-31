@@ -23,7 +23,7 @@ command:
 
 ```bash
 devd stop source
-devd run --name child --fork source
+devd fork source --name child
 ```
 
 ## Method
@@ -35,7 +35,7 @@ Script: [`exp14-ext4-product-lifecycle.sh`](./exp14-ext4-product-lifecycle.sh)
 3. Run a source workspace from netshoot with a host `/workspace` mount.
 4. Write persistent state under `/root` and record machine/SSH identity.
 5. Stop the source cleanly.
-6. Run a child with `--fork source`.
+6. Fork and start a child with `devd fork source --name child`.
 7. Verify inherited guest state, inherited host-mount configuration, fresh
    machine ID, and fresh SSH host key.
 8. Write child-only disk state, stop the child, restart the source, and verify
@@ -56,7 +56,7 @@ metadata handling.
 | Source state | Source must be stopped |
 | Fork implementation | Reflink/clonefile; no full-copy fallback |
 | Child state | Source guest disk state inherited |
-| Child lifecycle | Running and SSH-ready when `run --fork` returns |
+| Child lifecycle | Running and SSH-ready when `fork` returns |
 | Machine ID and SSH host keys | Different from source |
 | Host project mount | Reused by default; host files not copied |
 | Child disk writes | Not visible after source restart |
@@ -74,7 +74,7 @@ The fork run produced:
 |---|---:|
 | Source disk → child disk clone | **16ms** |
 | Child boot → SSH | **0.20s** |
-| `run --fork` create-to-SSH | **0.22s** |
+| `fork` create-to-SSH | **0.22s** |
 | Persistent source state inherited | PASS |
 | Machine identity divergence | PASS |
 | SSH host-key divergence | PASS |
@@ -87,5 +87,5 @@ The fork run produced:
 **PASS.** The ext4 architecture is now the product lifecycle rather than an
 experimental alternate path. OCI images pay one digest-addressed conversion;
 normal workspace creation and stopped-workspace branching are single-file
-copy-on-write clones. `devd run --name child --fork source` returns with the
-child running and independently identified in roughly 220ms on the test host.
+copy-on-write clones. `devd fork source --name child` returns with the child
+running and independently identified in roughly 220ms on the test host.

@@ -6,6 +6,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"devd/internal/db"
+	"devd/internal/vm"
 )
 
 var stopCmd = &cobra.Command{
@@ -30,7 +31,12 @@ func runStop(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	if ws.State != "running" {
+	if ws.State != "running" || !vm.IsRunning(ws.PID) {
+		if ws.State == "running" {
+			if err := db.SetWorkspaceState(database, name, "stopped", 0); err != nil {
+				return fmt.Errorf("reconcile workspace state: %w", err)
+			}
+		}
 		fmt.Printf("INFO Workspace %q is already stopped\n", name)
 		return nil
 	}

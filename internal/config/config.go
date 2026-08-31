@@ -58,6 +58,33 @@ func DBPath() (string, error) {
 	return filepath.Join(dir, "devd.db"), nil
 }
 
+// DaemonSocketPath returns the local proxy daemon control socket path.
+func DaemonSocketPath() (string, error) {
+	dir, err := DevdDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "daemon.sock"), nil
+}
+
+// DaemonLockPath returns the lock held for the lifetime of the proxy daemon.
+func DaemonLockPath() (string, error) {
+	dir, err := DevdDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "daemon.lock"), nil
+}
+
+// DaemonLogPath returns the background proxy daemon log path.
+func DaemonLogPath() (string, error) {
+	dir, err := DevdDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "daemon.log"), nil
+}
+
 // SSHDir returns ~/.devd/ssh/, creating it if needed.
 func SSHDir() (string, error) {
 	dir, err := DevdDir()

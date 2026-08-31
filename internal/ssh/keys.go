@@ -36,10 +36,9 @@ func EnsureKeypair() (string, error) {
 		"-N", "", // no passphrase
 		"-C", "devd",
 	)
-	cmd.Stdout = os.Stderr
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("ssh-keygen: %w", err)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("ssh-keygen: %w\n%s", err, output)
 	}
 
 	pub, err := os.ReadFile(pubPath)

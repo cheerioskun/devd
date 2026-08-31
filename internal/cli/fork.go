@@ -5,11 +5,96 @@ import (
 	"os"
 	"time"
 
+	"github.com/spf13/cobra"
+
 	"devd/internal/config"
 	"devd/internal/db"
 	"devd/internal/storage"
 	"devd/internal/vm"
 )
+
+var forkCmd = &cobra.Command{
+	Use:   "fork <source>",
+	Short: "Clone and start a stopped workspace",
+	Long: `Clone the complete disk state of a stopped workspace and start the new
+workspace. The host project mount is reused unless --mount or --no-mount is
+supplied.`,
+	Args: cobra.ExactArgs(1),
+	RunE: runFork,
+}
+
+var (
+	forkName    string
+	forkCPUs    int
+	forkMemory  int
+	forkPorts   []int
+	forkMount   string
+	forkNoMount bool
+	forkUserCmd string
+)
+
+func init() {
+	forkCmd.Flags().StringVarP(&forkName, "name", "n", "", "new workspace name (generated when omitted)")
+	forkCmd.Flags().IntVar(&forkCPUs, "cpus", config.DefaultCPUs, "number of vCPUs")
+	forkCmd.Flags().IntVar(&forkMemory, "memory", config.DefaultMemory, "memory in MB")
+	forkCmd.Flags().IntSliceVarP(&forkPorts, "ports", "p", nil, "host ports managed by devd")
+	forkCmd.Flags().StringVar(&forkMount, "mount", "", "override host:guest volume mount")
+	forkCmd.Flags().BoolVar(&forkNoMount, "no-mount", false, "do not reuse the source host mount")
+	forkCmd.Flags().StringVar(&forkUserCmd, "cmd", "", "override startup command")
+}
+
+func runFork(cmd *cobra.Command, args []string) error {
+	if forkNoMount && cmd.Flags().Changed("mount") {
+		return fmt.Errorf("--mount and --no-mount cannot be used together")
+	}
+	destinationName := forkName
+	var err error
+	if destinationName == "" {
+		destinationName, err = generatedWorkspaceName(args[0])
+		if err != nil {
+			return err
+		}
+		fmt.Printf("INFO Generated workspace name %q\n", destinationName)
+	}
+
+	mount := forkMount
+	mountChanged := cmd.Flags().Changed("mount") || forkNoMount
+	if forkNoMount {
+		mount = ""
+	}
+	started := time.Now()
+	workspace, err := doFork(args[0], destinationName, forkOverrides{
+		CPUs:               forkCPUs,
+		CPUsChanged:        cmd.Flags().Changed("cpus"),
+		Memory:             forkMemory,
+		MemoryChanged:      cmd.Flags().Changed("memory"),
+		Ports:              forkPorts,
+		PortsChanged:       cmd.Flags().Changed("ports"),
+		Mount:              mount,
+		MountChanged:       mountChanged,
+		UserCommand:        forkUserCmd,
+		UserCommandChanged: cmd.Flags().Changed("cmd"),
+	})
+	if err != nil {
+		return err
+	}
+	cloneElapsed := time.Since(started)
+
+	database, err := db.Open()
+	if err != nil {
+		return fmt.Errorf("open database: %w", err)
+	}
+	defer database.Close()
+	bootElapsed, err := startWorkspace(database, workspace)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("INFO Workspace %q forked from %q and ready\n", workspace.Name, args[0])
+	fmt.Printf("     SSH:    devd ssh %s\n", workspace.Name)
+	fmt.Printf("     Clone:  %s\n", cloneElapsed.Round(time.Millisecond))
+	fmt.Printf("     Boot:   %.2fs\n", bootElapsed.Seconds())
+	return nil
+}
 
 type forkOverrides struct {
 	CPUs               int
@@ -24,8 +109,8 @@ type forkOverrides struct {
 	UserCommandChanged bool
 }
 
-// doFork creates a stopped destination record and disk. The run command starts
-// it immediately after this function succeeds.
+// doFork creates a stopped destination record and disk. The fork command
+// starts it immediately after this function succeeds.
 func doFork(sourceName, destinationName string, overrides forkOverrides) (*db.Workspace, error) {
 	if err := config.ValidateWorkspaceName(sourceName); err != nil {
 		return nil, err
@@ -114,8 +199,11 @@ func doFork(sourceName, destinationName string, overrides forkOverrides) (*db.Wo
 	if overrides.PortsChanged {
 		reservedPorts = overrides.Ports
 	}
+	if err := validatePorts(reservedPorts); err != nil {
+		return nil, err
+	}
 
-	sshPort, err := db.NextSSHPort(database)
+	sshPort, err := nextAvailableSSHPort(database)
 	if err != nil {
 		return nil, fmt.Errorf("allocate ssh port: %w", err)
 	}
@@ -193,12 +281,6 @@ func doFork(sourceName, destinationName string, overrides forkOverrides) (*db.Wo
 	}
 
 	success = true
-	fmt.Printf("INFO Forked %q → %q in %s\n", sourceName, destinationName, time.Since(started).Round(time.Millisecond))
-	fmt.Printf("     Disk: %s\n", diskPath)
-	if mountHost == "" {
-		fmt.Printf("     Host mount: none\n")
-	} else {
-		fmt.Printf("     Host mount: %s → %s (host files were not copied)\n", mountHost, mountGuest)
-	}
+	fmt.Printf("INFO Cloned workspace disk in %s\n", time.Since(started).Round(time.Millisecond))
 	return destination, nil
 }

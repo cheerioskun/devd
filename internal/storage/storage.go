@@ -178,8 +178,11 @@ func ensureLocalImage(image string) (*buildahInspect, error) {
 		return nil, policyErr
 	}
 	args := []string{"--signature-policy", policy, "pull", "--os", "linux", "--arch", imageArchitecture(), image}
-	if output, pullErr := exec.Command("buildah", args...).CombinedOutput(); pullErr != nil {
-		return nil, fmt.Errorf("pull image %q: %w\n%s", image, pullErr, output)
+	pull := exec.Command("buildah", args...)
+	pull.Stdout = os.Stderr
+	pull.Stderr = os.Stderr
+	if pullErr := pull.Run(); pullErr != nil {
+		return nil, fmt.Errorf("pull image %q: %w", image, pullErr)
 	}
 	inspect, err = inspectImage(image)
 	if err != nil {

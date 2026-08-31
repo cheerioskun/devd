@@ -13,78 +13,77 @@ import (
 
 var runCmd = &cobra.Command{
 	Use:   "run [image]",
-	Short: "Create and start a new ext4 workspace VM",
-	Long: `Create and start a new microVM workspace from an OCI image, or fork the
-complete disk state of a stopped workspace with --fork.
+	Short: "Create and start a new workspace",
+	Long: `Create and start a new microVM workspace from an OCI image.
 
-Start the daemon first when multiple workspaces reserve the same contested port.`,
+The positional argument is always an image. Use --name to choose the workspace
+name; without it devd generates a name from the image. The current directory is
+mounted at /workspace unless --mount or --no-mount is supplied.`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: runRun,
 }
 
 var (
-	flagName       string
-	flagCPUs       int
-	flagMemory     int
-	flagPorts      []int
-	flagMount      string
-	flagCmd        string
-	flagForkSource string
+	flagName    string
+	flagCPUs    int
+	flagMemory  int
+	flagPorts   []int
+	flagMount   string
+	flagNoMount bool
+	flagCmd     string
 )
 
 func init() {
-	runCmd.Flags().StringVar(&flagName, "name", "", "workspace name (required)")
+	runCmd.Flags().StringVarP(&flagName, "name", "n", "", "workspace name (generated when omitted)")
 	runCmd.Flags().IntVar(&flagCPUs, "cpus", config.DefaultCPUs, "number of vCPUs")
 	runCmd.Flags().IntVar(&flagMemory, "memory", config.DefaultMemory, "memory in MB")
-	runCmd.Flags().IntSliceVar(&flagPorts, "ports", nil, "ports to reserve (contested ports get proxied)")
-	runCmd.Flags().StringVar(&flagMount, "mount", "", "host:guest volume mount (e.g. .:/workspace)")
-	runCmd.Flags().StringVar(&flagCmd, "cmd", "", "command to run inside VM after boot")
-	runCmd.Flags().StringVar(&flagForkSource, "fork", "", "fork a stopped workspace instead of an OCI image")
-	_ = runCmd.MarkFlagRequired("name")
+	runCmd.Flags().IntSliceVarP(&flagPorts, "ports", "p", nil, "host ports managed by devd")
+	runCmd.Flags().StringVar(&flagMount, "mount", "", "host:guest volume mount (default: .:/workspace)")
+	runCmd.Flags().BoolVar(&flagNoMount, "no-mount", false, "do not mount the current directory")
+	runCmd.Flags().StringVar(&flagCmd, "cmd", "", "startup command to run after each boot")
 }
 
 func runRun(cmd *cobra.Command, args []string) error {
 	totalStart := time.Now()
-	var ws *db.Workspace
-	var err error
-
-	if flagForkSource != "" {
-		if len(args) != 0 {
-			return fmt.Errorf("an image argument cannot be used with --fork")
-		}
-		ws, err = doFork(flagForkSource, flagName, forkOverrides{
-			CPUs:               flagCPUs,
-			CPUsChanged:        cmd.Flags().Changed("cpus"),
-			Memory:             flagMemory,
-			MemoryChanged:      cmd.Flags().Changed("memory"),
-			Ports:              flagPorts,
-			PortsChanged:       cmd.Flags().Changed("ports"),
-			Mount:              flagMount,
-			MountChanged:       cmd.Flags().Changed("mount"),
-			UserCommand:        flagCmd,
-			UserCommandChanged: cmd.Flags().Changed("cmd"),
-		})
-	} else {
-		image := config.DefaultImage
-		if len(args) > 0 {
-			image = args[0]
-		}
-		if dc, _ := config.LoadDevContainer("."); dc != nil {
-			if len(args) == 0 && dc.Image != "" {
-				image = dc.Image
-			}
-			if len(flagPorts) == 0 && len(dc.ForwardPorts) > 0 {
-				flagPorts = dc.ForwardPorts
-			}
-			if flagCmd == "" && dc.PostCreateCommand != "" {
-				flagCmd = dc.PostCreateCommand
-			}
-			if flagMount == "" {
-				flagMount = ".:/workspace"
-			}
-		}
-		ws, err = doCreate(flagName, image, flagCPUs, flagMemory, flagPorts, flagMount, flagCmd)
+	image := config.DefaultImage
+	if len(args) > 0 {
+		image = args[0]
 	}
+
+	devContainer, err := config.LoadDevContainer(".")
+	if err != nil {
+		return err
+	}
+	if devContainer != nil {
+		if len(args) == 0 && devContainer.Image != "" {
+			image = devContainer.Image
+		}
+		if !cmd.Flags().Changed("ports") && len(devContainer.ForwardPorts) > 0 {
+			flagPorts = devContainer.ForwardPorts
+		}
+		if devContainer.PostCreateCommand != "" {
+			fmt.Println("WARN devcontainer postCreateCommand is not supported yet")
+		}
+	}
+
+	if flagNoMount && cmd.Flags().Changed("mount") {
+		return fmt.Errorf("--mount and --no-mount cannot be used together")
+	}
+	mount := flagMount
+	if !flagNoMount && !cmd.Flags().Changed("mount") {
+		mount = ".:/workspace"
+	}
+
+	name := flagName
+	if name == "" {
+		name, err = generatedWorkspaceName(image)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("INFO Generated workspace name %q\n", name)
+	}
+
+	ws, err := doCreate(name, image, flagCPUs, flagMemory, flagPorts, mount, flagCmd)
 	if err != nil {
 		return err
 	}
@@ -102,16 +101,20 @@ func runRun(cmd *cobra.Command, args []string) error {
 	totalElapsed := time.Since(totalStart)
 	logFile := filepath.Join(ws.WorkspaceDir, "vm.log")
 
-	fmt.Printf("INFO SSH ready\n\n")
-	fmt.Printf("     Name:    %s\n", flagName)
+	fmt.Printf("INFO Workspace %q ready\n\n", ws.Name)
 	fmt.Printf("     Image:   %s\n", ws.Image)
-	fmt.Printf("     Disk:    %s\n", ws.DiskPath)
-	fmt.Printf("     SSH:     ssh devd-%s  (or: devd ssh %s)\n", flagName, flagName)
-	fmt.Printf("     Port:    %d\n", ws.SSHPort)
-	fmt.Printf("     PID:     %d\n", ws.PID)
+	fmt.Printf("     Mount:   %s\n", mountSummary(mount))
+	fmt.Printf("     SSH:     devd ssh %s  (or: ssh devd-%s)\n", ws.Name, ws.Name)
 	fmt.Printf("     Log:     %s\n", logFile)
 	fmt.Printf("     Create:  %.2fs\n", createElapsed.Seconds())
 	fmt.Printf("     Boot:    %.2fs\n", bootElapsed.Seconds())
 	fmt.Printf("     Total:   %.2fs\n", totalElapsed.Seconds())
 	return nil
+}
+
+func mountSummary(mount string) string {
+	if mount == "" {
+		return "none"
+	}
+	return mount
 }

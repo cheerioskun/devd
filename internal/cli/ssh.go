@@ -10,12 +10,13 @@ import (
 
 	"devd/internal/config"
 	"devd/internal/db"
+	"devd/internal/vm"
 )
 
 var sshCmd = &cobra.Command{
 	Use:   "ssh <workspace> [-- command...]",
 	Short: "SSH into a running workspace",
-	Long: `Open an SSH session to a running workspace. Like 'ignite ssh'.
+	Long: `Open an SSH session to a running workspace.
 Optionally pass a command to execute remotely:
 
   devd ssh myapp -- echo hello`,
@@ -27,6 +28,7 @@ Optionally pass a command to execute remotely:
 var shellCmd = &cobra.Command{
 	Use:                "shell <workspace> [-- command...]",
 	Short:              "Open a shell in a running workspace (alias for ssh)",
+	Hidden:             true,
 	Args:               cobra.MinimumNArgs(1),
 	DisableFlagParsing: false,
 	RunE:               runSSH,
@@ -55,8 +57,14 @@ func runSSH(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	if ws.State == "running" && !vm.IsRunning(ws.PID) {
+		if err := db.SetWorkspaceState(database, name, "stopped", 0); err != nil {
+			return fmt.Errorf("reconcile workspace state: %w", err)
+		}
+		ws.State = "stopped"
+	}
 	if ws.State != "running" {
-		return fmt.Errorf("workspace %q is not running (state: %s)", name, ws.State)
+		return fmt.Errorf("workspace %q is stopped; run 'devd start %s' first", name, name)
 	}
 
 	keyPath, err := config.PrivateKeyPath()

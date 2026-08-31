@@ -11,13 +11,10 @@ import (
 
 var startCmd = &cobra.Command{
 	Use:   "start <workspace>",
-	Short: "Start a stopped ext4 workspace VM",
-	Long: `Boot a previously created workspace.
-
-For contested ports to work, ensure 'devd daemon' is running before starting
-VMs so it can pre-empt those ports before TSI binds them.`,
-	Args: cobra.ExactArgs(1),
-	RunE: runStart,
+	Short: "Start a stopped workspace",
+	Long:  `Boot a previously created workspace and wait until SSH is ready.`,
+	Args:  cobra.ExactArgs(1),
+	RunE:  runStart,
 }
 
 func runStart(cmd *cobra.Command, args []string) error {

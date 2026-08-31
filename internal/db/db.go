@@ -284,8 +284,31 @@ func GetReservedPorts(db *sql.DB, workspace string) ([]int, error) {
 	return ports, rows.Err()
 }
 
+// GetAllReservedPorts returns every declared workspace port. The proxy daemon
+// pre-empts declared ports even before they become contested so later
+// workspaces can safely reserve the same port.
+func GetAllReservedPorts(db *sql.DB) ([]int, error) {
+	rows, err := db.Query(`
+		SELECT DISTINCT port
+		FROM reserved_ports
+		ORDER BY port`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ports []int
+	for rows.Next() {
+		var p int
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		ports = append(ports, p)
+	}
+	return ports, rows.Err()
+}
+
 // GetAllContestedPorts returns ports reserved by more than one workspace (any state).
-// Used by the daemon to pre-empt ports before VMs start.
 func GetAllContestedPorts(db *sql.DB) ([]int, error) {
 	rows, err := db.Query(`
 		SELECT port

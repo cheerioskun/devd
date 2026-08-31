@@ -1,47 +1,42 @@
 # devd
 
-[![CI](https://github.com/your/devd/actions/workflows/ci.yml/badge.svg)](https://github.com/your/devd/actions/workflows/ci.yml)
+[![CI](https://github.com/cheerioskun/devd/actions/workflows/ci.yml/badge.svg)](https://github.com/cheerioskun/devd/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
 Lightweight, isolated, movable development workspaces powered by microVMs.
 
 ```
-$ devd run nicolaka/netshoot --name myapp
-INFO Creating workspace "myapp" (nicolaka/netshoot, 2 CPUs, 512 MB)
-INFO Prepared ext4 template in 9.63s   # first use of this image digest only
-INFO Cloned workspace disk in 24ms
-INFO Starting VM...
-INFO Waiting for SSH on port 2222...
-INFO SSH ready
+$ devd run nicolaka/netshoot -n myapp
+INFO Preparing image "docker.io/nicolaka/netshoot"...
+INFO Using cached ext4 template sha256:f460dc...
+INFO Cloned workspace disk in 18ms
+INFO Starting workspace "myapp"...
+INFO Workspace "myapp" ready
 
-     Name:    myapp
-     Image:   nicolaka/netshoot
-     SSH:     ssh devd-myapp  (or: devd ssh myapp)
-     Port:    2222
-     Boot:    1.01s
+     Image:   docker.io/nicolaka/netshoot
+     Mount:   .:/workspace
+     SSH:     devd ssh myapp  (or: ssh devd-myapp)
+     Create:  0.04s
+     Boot:    0.31s
 
 $ devd ssh myapp
 root@myapp:~#
 
-$ devd create nicolaka/netshoot --name frontend --ports 8080
-$ devd daemon &                    # pre-empts :8080 on host
-$ devd start frontend              # TSI falls back — loopback isolated
-
-$ devd switch frontend
-INFO Switched active workspace: myapp → frontend
-INFO Contested ports [8080] now route to "frontend"
-
-$ curl localhost:8080              # → hits frontend's server
+$ devd stop myapp
+$ devd start myapp
 
 $ devd ps
-NAME       IMAGE              STATE    SSH PORT  CPUS  MEMORY  ACTIVE  CREATED
-myapp      nicolaka/netshoot  running  2222      2     512 MB          5m ago
-frontend   nicolaka/netshoot  running  2223      2     512 MB  *       2m ago
+NAME   IMAGE                        STATE    SSH PORT  CPUS  MEMORY  ACTIVE  CREATED
+myapp  docker.io/nicolaka/netshoot  running  2222      2     512 MB  *       5m ago
 ```
 
 ## What is devd?
 
-devd runs each development workspace in its own microVM using [libkrun](https://github.com/containers/libkrun). Each workspace root is one writable ext4 disk, APFS-cloned (or reflinked on Linux) from an immutable OCI template. Your code stays on the host, mounted into the VM via virtio-fs. Each workspace gets its own Linux kernel, persistent disk, full isolation, and near-native performance — without Docker Desktop or a hidden background VM.
+devd runs each development workspace in its own microVM using [libkrun](https://github.com/containers/libkrun). Each workspace root is one writable ext4 disk, APFS-cloned (or reflinked on Linux) from an immutable OCI template. By default, the current directory stays on the host and is mounted at `/workspace` through virtio-fs. Each workspace gets its own Linux kernel, persistent disk, full isolation, and near-native performance — without Docker Desktop or a hidden background VM.
+
+The current runtime requires images to contain OpenSSH server utilities. A
+general-purpose default image and image-independent guest agent are planned;
+`nicolaka/netshoot` is the presently tested default.
 
 ## Why not Docker / Podman / Dev Containers?
 
@@ -53,7 +48,7 @@ devd skips the intermediary. libkrun talks directly to Apple's Hypervisor.framew
 |---|---|---|---|
 | macOS architecture | LinuxKit VM → containers | Fedora VM → containers | Direct microVM per workspace |
 | VM layers | 2 (host → VM → container) | 2 (host → VM → container) | 1 (host → microVM) |
-| Background overhead | ~2-4GB RAM always | ~1-2GB RAM always | 0 when no workspaces running |
+| Background overhead | ~2-4GB RAM always | ~1-2GB RAM always | 0 VM RAM; tiny proxy only for declared ports |
 | Per-workspace isolation | Shared kernel | Shared kernel | Separate kernel per workspace |
 | Workspace switching | N/A | N/A | `devd switch` — instant, zero-disruption |
 | Boot to SSH | N/A | ~5-30s (machine start) | **~1s** (measured) |
@@ -62,19 +57,35 @@ On Linux, devd uses the same libkrun microVMs (via KVM). Same CLI, same behavior
 
 ## Prerequisites
 
-- macOS (Apple Silicon) or Linux
-- Buildah, e2fsprogs, libkrun, and libkrunfw (`install-runtime` in the project shell)
+- macOS on Apple Silicon (binary installer) or Linux (source build currently)
 - A reflink-capable filesystem: APFS on macOS, or reflink support on Linux
-- Go 1.25+ and a C compiler (to build the three-binary devd bundle)
+- Homebrew on macOS; the installer uses it for libkrun, firmware, Buildah, and e2fsprogs
 
 ## Install
 
-**Option 1: Download bundle (Recommended)**
-Download the latest three-binary bundle (`devd`, `devd-vm`, and `devd-image-helper`) for your platform from the [Releases page](https://github.com/your/devd/releases). Keep the companions beside `devd` in the same directory.
+**Apple Silicon macOS:**
 
-**Option 2: Build from source**
 ```bash
-git clone https://github.com/your/devd && cd devd
+curl -fsSL https://raw.githubusercontent.com/cheerioskun/devd/main/install.sh | bash
+```
+
+The installer downloads and verifies the released three-binary bundle, installs
+its Homebrew runtime dependencies, and places `devd`, `devd-vm`, and
+`devd-image-helper` together in Homebrew's `bin` directory. Set `DEVD_VERSION`
+to install a specific release or `DEVD_INSTALL_DIR` to choose another location.
+
+To inspect before running:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/cheerioskun/devd/main/install.sh
+less install.sh
+bash install.sh
+```
+
+**Build from source (macOS or Linux):**
+
+```bash
+git clone https://github.com/cheerioskun/devd && cd devd
 devenv shell
 install-runtime   # first time only
 build             # bin/devd + bin/devd-vm + bin/devd-image-helper
@@ -83,102 +94,79 @@ build             # bin/devd + bin/devd-vm + bin/devd-image-helper
 ## Quick Start
 
 ```bash
-# Create and start a workspace in one command
-devd run nicolaka/netshoot --name myapp
+# IMAGE is positional; the name is optional.
+devd run nicolaka/netshoot -n myapp
 devd ssh myapp
 
-# Step-by-step (use this when you need multi-workspace port routing)
-devd create nicolaka/netshoot --name myapp --ports 8080
-devd daemon &        # only needed when multiple workspaces share a port
+# Without -n, devd generates an image-based name such as netshoot-a1b2c3.
+devd run nicolaka/netshoot
+
+# Stop and restart the same persistent workspace.
+devd stop myapp
 devd start myapp
 
-# Branch complete guest state in milliseconds
+# Branch complete guest state in milliseconds.
 devd stop myapp
-devd run --name experiment --fork myapp
+devd fork myapp -n experiment
 ```
 
-`run --fork` clones the stopped source's ext4 disk, including installed packages,
-caches, and `/root` state, then boots the child immediately. It gets fresh ports,
-machine ID, and SSH host keys.
-The host project mount is reused by default; pass `--mount` to select a different
-checkout. Host files are never copied by `fork`.
+`fork` clones the stopped source's ext4 disk, including installed packages,
+caches, and `/root` state, then boots the child immediately. The child receives
+a fresh machine ID and SSH host keys. Its host project mount is reused by
+default; pass `--mount` for another checkout or `--no-mount` to omit it. Host
+files are never copied.
 
 ## Commands
 
 ```
-devd create [image] --name <n>     Create a workspace (stopped)
-devd start <n>                     Boot a stopped workspace
-devd run [image] --name <n>        Create + start from an OCI image
-devd run --name <n> --fork <src>   Clone a stopped workspace and start it
+devd run [image] [-n name]          Create and start a new workspace
+devd start <name>                   Start an existing stopped workspace
+devd stop <name>                    Stop a running workspace
+devd fork <source> [-n name]        Clone and start a stopped workspace
 
-devd ps [-a]                       List workspaces (running, or all)
-devd ssh <n>                       SSH into a running workspace
-devd shell <n>                     Alias for ssh
-devd stop <n>                      Stop a running workspace
-devd rm [-f] <n>                   Remove a workspace
-
-devd daemon [--ports 8080,3000]    Run the proxy daemon (pre-empts contested ports)
-devd switch <n>                    Route contested ports to this workspace
+devd ssh <name> [-- command...]     Open a shell or execute a command
+devd ps [-a]                        List running workspaces (or all)
+devd logs [-f] <name>               Read VM logs
+devd switch <name>                  Route shared declared ports to a workspace
+devd rm [-f] <name>                 Remove a workspace and its disk
 ```
+
+The positional argument to `run` is always an OCI image. `run` always creates a
+new workspace; `start` is the explicit counterpart to `stop`.
 
 ### Flags
 
 | Flag | Commands | Description |
 |------|----------|-------------|
-| `--name` | create, run | Workspace name (required) |
-| `--cpus` | create, run | vCPU count (default: 2) |
-| `--memory` | create, run | Memory in MB (default: 512) |
-| `--ports` | create, run | Ports to reserve (for proxy routing) |
-| `--mount` | create, run | Host:guest volume (e.g. `.:/workspace`) |
-| `--cmd` | create, run | Command to run inside VM after boot |
-| `--fork` | run | Stopped source workspace to clone and boot |
-| `-f` | rm | Force remove (stop if running) |
-| `-a` | ps | Show all workspaces including stopped |
+| `-n, --name` | run, fork | Workspace name; generated when omitted |
+| `--cpus` | run, fork | vCPU count (default: 2) |
+| `--memory` | run, fork | Memory in MB (default: 512) |
+| `-p, --ports` | run, fork | Host ports managed and routed by devd |
+| `--mount` | run, fork | Host:guest volume (e.g. `.:/workspace`) |
+| `--no-mount` | run, fork | Disable the default/inherited host mount |
+| `--cmd` | run, fork | Startup command run after each boot |
+| `-f` | rm | Stop a running workspace before removal |
+| `-a` | ps | Include stopped workspaces |
 
-## Multi-Workspace Port Routing
+## Port Routing
 
-When multiple workspaces claim the same port, devd handles it with a proxy-based architecture validated in [experiments 4–7](experiments/):
-
-1. **`devd daemon`** binds `0.0.0.0:<contested-port>` on the host before VMs start
-2. This **pre-empts TSI** — libkrun's host-side bind fails, so guest kernels fall back to real sockets
-3. **Guest loopback is isolated** — `curl localhost:8080` inside each VM reaches that VM's own server
-4. **SSH tunnels** relay from host relay ports to each VM's `localhost:<port>`
-5. **`devd switch`** changes which tunnel the proxy routes to — instant, no processes killed
-
-```
-                    ┌─────────────┐
-  browser/curl ───► │ devd daemon │
-                    │ 0.0.0.0:8080│
-                    └──────┬──────┘
-                           │ routes to active workspace
-                    ┌──────┴──────┐
-                    ▼             ▼
-           SSH tunnel:9001  SSH tunnel:9002
-           (host-side)      (host-side)
-                │                │
-                ▼                ▼
-          VM-A :2222       VM-B :2223
-          (sshd via TSI)   (sshd via TSI)
-                │                │
-                ▼                ▼
-          VM-A localhost   VM-B localhost
-          :8080 (local)    :8080 (local)
-          loopback ✓       loopback ✓
-```
-
-The correct workflow for contested ports:
+Declare host-facing ports when creating a workspace. devd starts its lightweight
+proxy automatically and binds each declared port before the VM boots:
 
 ```bash
-devd create nicolaka/netshoot --name backend --ports 8080
-devd create nicolaka/netshoot --name frontend --ports 8080
-devd daemon &           # pre-empts :8080 BEFORE VMs start
-devd start backend
-devd start frontend
+devd run nicolaka/netshoot -n backend -p 8080
+devd run nicolaka/netshoot -n frontend -p 8080
+
 devd switch frontend    # host:8080 → frontend
 devd switch backend     # host:8080 → backend
 ```
 
-Ports that only one workspace uses are auto-exposed by TSI — no daemon needed.
+There is no daemon command or startup ordering to manage. Pre-emption forces TSI
+to use real guest sockets for declared ports, so both VMs retain isolated
+`localhost:8080`. The host proxy reaches the selected guest through an SSH
+stream-local tunnel. Switching affects the next connection and does not restart
+VMs or guest processes. Undeclared ports retain libkrun's automatic TSI
+exposure.
 
 ## IDE Integration
 
@@ -220,23 +208,23 @@ internal/
   db/              SQLite state layer (pure Go, no CGO)
   storage/         OCI template cache + ext4 clone lifecycle
   vm/              devd-vm process wrapper + guest init
+  ssh/             SSH keypair + ~/.ssh/config management
+  proxy/           Automatic port pre-emption and routing
 cmd/devd-vm/       separately linked libkrun runtime companion
 cmd/devd-image-helper/ static Linux OCI-to-ext4 metadata copier
-  ssh/             SSH keypair + ~/.ssh/config management
-  proxy/           Port pre-emption and TCP proxy daemon
-experiments/       Networking experiments validating the architecture
+experiments/       Empirical architecture and performance validation
 ```
 
 ## Roadmap
 
 | Version | Scope | Status |
 |---------|-------|--------|
-| **v0.1** | Ext4 lifecycle + switch | **Current** — create/start/run (`--fork`), ssh, stop, rm, daemon, switch |
-| v0.1.1 | Default image (Alpine + Nix, ~50MB), `devd pull` for pre-caching | Planned |
-| v0.1.2 | devcontainer.json subset (postCreateCommand, forwardPorts, dotfiles) | Planned |
+| **v0.1** | Ext4 lifecycle + switch | **Current** — run/start/stop/fork, SSH, automatic port routing |
+| v0.1.1 | General-purpose default image, `devd pull` for pre-caching | Planned |
+| v0.1.2 | devcontainer.json lifecycle hooks and dotfiles | Planned |
 | v0.2 | Portable snapshots | export/import ext4 disk + JSON sidecar |
 | v0.3 | Remote storage | `devd snapshot --to s3://...` |
-| v0.4 | Remote nodes | `devd create --remote <server>`, agent mode |
+| v0.4 | Remote nodes | `devd run --remote <server>`, agent mode |
 | v0.5 | Migration | `devd move myapp --to <server>` |
 | v0.6+ | Polish | IDE extension, devenv.yaml generation, `brew install devd` |
 
