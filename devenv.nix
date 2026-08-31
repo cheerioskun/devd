@@ -107,28 +107,7 @@
   '';
 
   scripts.install-krunvm.exec = ''
-    set -euo pipefail
-    if command -v krunvm &>/dev/null; then
-      echo "krunvm already installed: $(krunvm --version)"
-      exit 0
-    fi
-    if [[ "$(uname)" == "Darwin" ]]; then
-      echo "Installing krunvm via Homebrew..."
-      brew tap libkrun/krun
-      brew trust libkrun/krun
-      # The tap currently infers libkrunfw's version as "64" from its
-      # aarch64 source filename, so Homebrew requests a nonexistent bottle.
-      # Install that dependency from source until the upstream formula is fixed.
-      brew install --build-from-source libkrun/krun/libkrunfw
-      brew install libkrun/krun/krunvm
-    elif command -v dnf &>/dev/null; then
-      echo "Installing krunvm via DNF (Fedora COPR)..."
-      sudo dnf copr enable -y slp/krunvm
-      sudo dnf install -y krunvm
-    else
-      echo "Manual install required. See: https://github.com/containers/krunvm"
-      exit 1
-    fi
+    exec "${config.env.DEVENV_ROOT}/scripts/install-krunvm" "$@"
   '';
 
   # https://devenv.sh/basics/
