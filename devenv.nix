@@ -114,7 +114,13 @@
     fi
     if [[ "$(uname)" == "Darwin" ]]; then
       echo "Installing krunvm via Homebrew..."
-      brew install krunvm
+      brew tap libkrun/krun
+      brew trust libkrun/krun
+      # The tap currently infers libkrunfw's version as "64" from its
+      # aarch64 source filename, so Homebrew requests a nonexistent bottle.
+      # Install that dependency from source until the upstream formula is fixed.
+      brew install --build-from-source libkrun/krun/libkrunfw
+      brew install libkrun/krun/krunvm
     elif command -v dnf &>/dev/null; then
       echo "Installing krunvm via DNF (Fedora COPR)..."
       sudo dnf copr enable -y slp/krunvm
