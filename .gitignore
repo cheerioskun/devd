@@ -11,4 +11,5 @@ devenv.local.yaml
 
 # build output
 bin/
+dist/
 /devd

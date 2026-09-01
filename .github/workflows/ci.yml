@@ -2,26 +2,51 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
 
 jobs:
   check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
-      - name: Setup Go
-        uses: actions/setup-go@v5
+
+      - uses: actions/setup-go@v5
         with:
-          go-version: stable
-          
-      - name: Build
-        run: go build ./cmd/devd
-        
+          go-version-file: go.mod
+
+      - name: Check formatting
+        run: test -z "$(gofmt -l $(find . -name '*.go' -not -path './vendor/*'))"
+
       - name: Vet
         run: go vet ./...
-        
+
       - name: Test
         run: go test ./...
+
+      - name: Build CGO-free CLI
+        env:
+          CGO_ENABLED: 0
+        run: go build ./cmd/devd
+
+      - name: Check shell syntax
+        run: bash -n install.sh scripts/* benchmark.sh test-functional.sh experiments/*.sh
+
+  macos-bundle:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Require Apple Silicon runner
+        run: test "$(uname -m)" = arm64
+
+      - name: Install runtime build dependencies
+        run: scripts/install-runtime
+
+      - name: Build and verify three-binary bundle
+        run: scripts/package-release v0.0.0-ci

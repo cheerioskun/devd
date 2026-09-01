@@ -31,6 +31,7 @@ Inside the devenv shell:
 | `setup` | `go mod download` |
 | `clean` | Remove `bin/` |
 | `install-runtime` | Install Buildah, e2fsprogs, libkrun, and firmware |
+| `scripts/package-release <version>` | Build and verify a host-native release archive |
 
 ## Project Structure
 
@@ -43,8 +44,8 @@ internal/
   vm/              devd-vm wrapper and generic guest init
 cmd/devd-vm/       separately linked libkrun companion
 cmd/devd-image-helper/ static Linux metadata-preserving copy helper
-  ssh/             CA, certificates, ~/.ssh/config management
-  proxy/           Port pre-emption and proxy daemon (Phase 1b)
+  ssh/             SSH keypair and ~/.ssh/config management
+  proxy/           Automatic declared-port pre-emption and routing
   config/          devcontainer.json parsing
 experiments/       Networking experiments validating the proxy architecture
 ```
@@ -73,8 +74,23 @@ The `check` script runs the same validations as the git hooks plus `go test`.
 ## Testing
 
 ```bash
-test     # go test ./...
-check    # full gate: gofmt + vet + lint + test
+test                    # go test ./...
+check                   # gofmt + vet + lint + unit tests
+bash test-functional.sh # hardware-backed end-to-end product regression
+bash benchmark.sh       # user-visible performance acceptance benchmark
 ```
 
-For experiments (networking/proxy validation), see the `experiments/` directory. Each experiment has a markdown doc explaining what it tests and the results.
+The functional suite uses an isolated temporary state directory and exercises
+run/start/stop/fork, persistent disk state, the default project mount, fresh
+fork identity, automatic shared-port routing, switch, and cleanup. It performs
+a cold image conversion by default. During development, reuse an existing
+immutable cache without reusing workspace state:
+
+```bash
+DEVD_TEST_IMAGE_CACHE="$HOME/.devd/images" SKIP_BUILD=1 bash test-functional.sh
+```
+
+See [BENCHMARK.md](BENCHMARK.md) for benchmark boundaries, controls, acceptance
+rationale, and the current baseline. For architecture experiments, see
+`experiments/`. Each experiment includes a Markdown method, acceptance criteria,
+results, and conclusion.

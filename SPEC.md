@@ -20,7 +20,7 @@ Use microVMs directly — one per workspace — instead of running containers in
 │  ────────────────────────────────────────    │
 │  • Shell out to devd-vm (VM lifecycle)       │
 │  • SSH config + CA manager                   │
-│  • Port proxy (contested ports)              │
+│  • Automatic declared-port proxy             │
 │  • SQLite (workspace metadata)               │
 │  • S3 client (v0.3+)                         │
 └───────┬──────────────────────────────────────┘
@@ -37,13 +37,13 @@ Use microVMs directly — one per workspace — instead of running containers in
         │               │  :8080   │
         │               └──────────┘
         │
-        └── pre-empts ──► 0.0.0.0:<contested ports>
+        └── pre-empts ──► 0.0.0.0:<declared ports>
                           (blocks TSI, proxies to active VM)
 ```
 
 devd shells out to its separately linked `devd-vm` runtime companion for VM lifecycle. The Go binary remains CGO-free. On macOS, libkrun uses Apple's Hypervisor.framework; on Linux, it uses KVM. There is no intermediate VM layer. Each workspace is a first-class microVM whose writable root is one raw ext4 disk.
 
-**Networking** uses libkrun's TSI (Transparent Socket Impersonation). Ports bound inside a VM are auto-exposed on the host. For contested ports (multiple workspaces claiming the same port), devd pre-empts them on the host before VMs start. This causes TSI to fall back to real kernel sockets in the guest — preserving loopback — while a host-side proxy routes external traffic to the active workspace via SSH tunnels.
+**Networking** uses libkrun's TSI (Transparent Socket Impersonation). Undeclared guest ports are exposed automatically. Declared host-facing ports are always pre-empted by an automatically managed devd proxy before the VM starts. This gives stable semantics if another workspace later declares the same port, forces TSI to fall back to real guest sockets, and preserves guest loopback. The proxy reaches the selected guest through OpenSSH stream-local forwarding.
 
 ---
 
@@ -56,10 +56,10 @@ devd shells out to its separately linked `devd-vm` runtime companion for VM life
 | Guest root | raw ext4 over virtio-blk | One writable cloneable disk per workspace |
 | Host mount | virtio-fs (built into libkrun) | Host ↔ VM code mount at `/workspace` |
 | Networking | libkrun TSI | Transparent socket proxying via vsock |
-| Port proxy | devd daemon (Go, host-side) | Pre-empts contested ports, proxies via SSH tunnels |
+| Port proxy | automatically managed devd process | Pre-empts declared ports and routes through SSH stream-local tunnels |
 | SSH | Shared Ed25519 keypair | IDE integration, SSH tunnels, `~/.ssh/config` management |
 | State | [modernc.org/sqlite](https://pkg.go.dev/modernc.org/sqlite) | Workspace metadata, pure Go, no CGO |
-| Base image | Any OCI image | User supplies image (e.g. `nicolaka/netshoot`). A small default image (Alpine + Nix, ~50MB) is planned for v0.1.1. |
+| Base image | OCI image with current guest prerequisites | The ext4 converter is image-agnostic; v0.1 boot currently requires OpenSSH server utilities in the image |
 | IDE integration | SSH | VS Code Remote-SSH, Cursor, any SSH-capable editor |
 | Env config | [devenv](https://devenv.sh) / devcontainer.json (subset) | User-defined environment |
 
@@ -95,7 +95,7 @@ krunvm's Buildah-VFS workspace lifecycle is not used. Directory-root mode exists
 
 ### Digest-addressed ext4 image cache
 
-devd accepts any OCI image but never creates a Buildah container per workspace. On first use it resolves the local image to an immutable digest, exposes that rootfs read-only to a pinned helper VM, and copies Linux metadata into a sparse ext4 image. The completed template is checked, fsynced, and atomically published under:
+devd's storage pipeline accepts OCI images and never creates a Buildah container per workspace. On first use it resolves the local image to an immutable digest, exposes that rootfs read-only to a pinned helper VM, and copies Linux metadata into a sparse ext4 image. The completed template is checked, fsynced, and atomically published under:
 
 ```text
 ~/.devd/images/sha256-<digest>-<arch>-v<format>-<size>/rootfs.ext4
@@ -105,9 +105,14 @@ A workspace is one copy-on-write clone at `~/.devd/workspaces/<name>/rootfs.ext4
 
 The default sparse capacity is 32 GiB. Physical host space is consumed only by template data and blocks changed by each clone.
 
-### Image-agnostic, registry-hosted default
+### OCI storage, explicit guest prerequisites
 
-devd resolves any OCI image you specify through Buildah, then boots only its cached ext4 representation. A small default image (Alpine + Nix, ~50MB) remains desirable to reduce first-use conversion and transfer costs.
+devd resolves OCI images through Buildah, then boots only their cached ext4
+representation. The current injected init invokes `sshd`, `ssh-keygen`, and
+basic shell utilities from the image, so storage compatibility is broader than
+boot compatibility. A general-purpose published default and an
+image-independent guest agent are required before claiming arbitrary-image
+support.
 
 ### Disk fork and cold migration only
 
@@ -135,59 +140,40 @@ Key behaviors (empirically verified, see `experiments/`):
 
 ### Port Pre-emption and the Proxy Architecture
 
-When a user declares contested ports (ports used by multiple workspaces), devd pre-empts them:
+Every port declared with `--ports` is managed from the first workspace onward:
 
-1. **Before VMs start**, the devd daemon binds `0.0.0.0:<contested-port>` on the host (without `SO_REUSEPORT`).
-2. **TSI's host-side bind fails** for those ports. The guest falls back to real kernel sockets.
-3. **Guest loopback works** — truly local, not proxied through TSI. `curl localhost:8080` inside any VM hits that VM's own server.
-4. **The daemon owns the port** on the host. External traffic (browser, curl from host) goes to the daemon.
-5. **SSH tunnels** relay traffic from the daemon to the active VM. Each VM runs sshd on a unique port (assigned by devd, exposed by TSI). The daemon creates `ssh -L` tunnels from host-side relay ports to each VM's `localhost:<contested-port>`.
-6. **Switching** = change which tunnel the daemon routes to.
+1. `run`, `start`, or `fork` asks the local proxy process to bind
+   `0.0.0.0:<declared-port>` before starting the VM. The process and its Unix
+   control socket are started automatically.
+2. TSI's host-side bind fails for that port, so the guest uses a real kernel
+   socket and guest loopback remains local.
+3. The host listener selects the active running workspace that declares the
+   port. A sole running claimant is selected even if another workspace is
+   globally active.
+4. On first traffic, the proxy creates an OpenSSH `-L` stream-local tunnel:
+   a short host Unix socket forwards to the guest's `127.0.0.1:<port>`.
+5. `devd switch` changes the database routing decision. Existing VMs, guest
+   listeners, and established connections are not restarted.
+6. Removing the last port declaration shuts down the proxy process. Undeclared
+   guest ports continue to use transparent TSI exposure.
 
-Non-contested ports (used by only one workspace) are auto-exposed by TSI with no proxy involvement.
-
-```
-                    ┌─────────────┐
-  browser/curl ───► │ devd daemon │
-                    │ 0.0.0.0:8080│
-                    └──────┬──────┘
-                           │ proxy to active VM's relay
-                    ┌──────┴──────┐
-                    ▼             ▼
-           SSH tunnel:9001  SSH tunnel:9002
-           (host-side)      (host-side)
-                │                │
-                │ ssh -L         │ ssh -L
-                ▼                ▼
-          VM-A :2222       VM-B :2223
-          (sshd via TSI)   (sshd via TSI)
-                │                │
-                ▼                ▼
-          VM-A localhost   VM-B localhost
-          :8080 (local)    :8080 (local)
-          loopback ✓       loopback ✓
-```
+Pre-empting the first declaration, rather than waiting until a port becomes
+contested, removes the impossible transition where a running VM already owns
+the host port when a second workspace claims it. It also removes all manual
+daemon ordering from the user-facing contract.
 
 ### devd switch
 
-```
-$ devd switch frontend
-
-1. devd identifies contested ports between current active workspace and target
-   → e.g., both claim :8080
-
-2. Daemon changes proxy target from backend's relay port to frontend's relay port
-   → host:8080 now routes to frontend
-
-3. Both VMs keep running. No server processes killed. No guest-side changes.
-   Guest loopback works in both VMs throughout.
-```
+`devd switch frontend` marks `frontend` active. For each shared declared port it
+claims, the next host connection routes through frontend's SSH tunnel. Ports
+with one running claimant continue routing to that claimant.
 
 **Properties:**
 - **Zero disruption.** Nothing is killed or restarted inside any VM.
-- **Instant (~20ms).** Change the proxy target; next connection goes to the new VM.
-- **Fully reversible.** A→B→A→B switching is clean with no state corruption.
-- **All VMs independently reachable.** Even while the proxy routes to one VM, others are reachable via their relay ports or SSH.
+- **Fast.** Existing tunnels switch on the next connection; the first connection
+  to a workspace may pay one SSH handshake.
+- **Fully reversible.** A→B→A→B switching does not mutate guest state.
+- **Guest isolation.** Every participating VM keeps independent guest loopback.
 
 ### Platform Differences
 
@@ -206,16 +192,17 @@ Two paths. devd orchestrates the VM; the user configures what's inside.
 
 **devenv** (primary): User has `devenv.nix` in their project. Inside the VM, `devenv up` starts services via process-compose.
 
-**devcontainer.json** (compatibility, subset):
+**devcontainer.json** (compatibility, current subset):
 
 | Field | Behavior |
 |-------|----------|
-| `postCreateCommand` | Run after first workspace creation |
-| `forwardPorts` | Added to workspace's reserved ports |
-| `dotfiles.repository` | `git clone` + `install.sh` on create |
-| `customizations` | Shell config, editor settings |
+| `image` | Used when `run` has no image argument |
+| `forwardPorts` | Added to the workspace's automatically managed ports |
+| `postCreateCommand` | Parsed, but currently emits an explicit unsupported warning |
 
-The `image` field is respected as the base OCI image for the workspace. Full devcontainer spec features (Docker Compose, lifecycle hooks, features) are out of scope.
+JSONC comments and trailing commas are accepted. Lifecycle hooks, dotfiles,
+features, Docker Compose, and customizations remain planned rather than being
+silently approximated with incorrect semantics.
 
 ---
 
@@ -232,9 +219,9 @@ CREATE TABLE workspaces (
     image_digest   TEXT NOT NULL,
     parent_name    TEXT NOT NULL DEFAULT '',
     ssh_port      INTEGER NOT NULL UNIQUE,   -- unique sshd port per VM
-    relay_port    INTEGER NOT NULL UNIQUE,    -- host-side SSH tunnel relay port
+    relay_port    INTEGER NOT NULL UNIQUE,    -- legacy v0.1 allocation; no longer used for routing
     state         TEXT DEFAULT 'stopped',     -- stopped | running
-    is_active     BOOLEAN DEFAULT FALSE,      -- receives traffic on contested ports
+    is_active     BOOLEAN DEFAULT FALSE,      -- selected target for shared declared ports
     created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -254,7 +241,7 @@ CREATE TABLE snapshots (
 );
 ```
 
-Reserved ports are declared in the workspace config (via `forwardPorts` in devcontainer.json, or devd CLI flags). Ports claimed by multiple running workspaces are contested — devd pre-empts them and proxies via SSH tunnels.
+Reserved ports are declared in the workspace config (via `forwardPorts` in devcontainer.json, or devd CLI flags). All declared ports are pre-empted before VM start and routed by the automatic proxy; shared ports follow the active workspace.
 
 ---
 
@@ -262,7 +249,7 @@ Reserved ports are declared in the workspace config (via `forwardPorts` in devco
 
 | Version | Scope | Success Criteria |
 |---------|-------|------------------|
-| **v0.1** | Ext4 lifecycle, fork, and switch | `devd run nicolaka/netshoot --name myapp && devd ssh myapp` works; `devd run --name child --fork <stopped-parent>` preserves disk state, creates fresh identity, and boots the child; file mount is bidirectional; `devd switch` routes contested ports. |
+| **v0.1** | Ext4 lifecycle, fork, and switch | `devd run nicolaka/netshoot -n myapp && devd ssh myapp` works; `devd fork <stopped-parent> -n child` preserves disk state, creates fresh identity, and boots the child; the default file mount is bidirectional; automatic routing and `devd switch` handle shared declared ports. |
 | **v0.2** | Portable snapshots | export/import the ext4 disk plus JSON sidecar. |
 | **v0.3** | Remote storage | `devd snapshot --to s3://...` works. Restore on a fresh machine from S3. |
 | **v0.4** | Remote nodes | `devd new --remote <server>`. Server runs devd in agent mode. SSH/mTLS control plane. |
@@ -271,7 +258,7 @@ Reserved ports are declared in the workspace config (via `forwardPorts` in devco
 
 ### v0.1 Scope Boundaries
 
-**In scope**: Workspace lifecycle (create/run/ssh/stop/rm), `devd switch` via proxy-based port routing, microVM per workspace, SSH access (shared keypair), base image selection (any OCI image).
+**In scope**: Workspace lifecycle (run/start/stop/fork/rm), automatic proxy-based port routing and `devd switch`, microVM per workspace, SSH access (shared keypair), and OCI image selection for images containing the current OpenSSH guest prerequisites.
 
 **v0.1.2**: devcontainer.json subset (postCreateCommand, forwardPorts, dotfiles).
 
@@ -306,8 +293,7 @@ Convenience wrappers around QEMU or Virtualization.framework. Still a single VM 
 ## Open Questions
 
 1. **libkrun pause/resume**: libkrun currently has no pause/suspend API. If upstream adds this, it could complement the proxy switch by reducing idle VM resource usage.
-2. **Proxy daemon lifecycle**: Should the daemon be a long-running background process, or started/stopped with workspace commands? Long-running is simpler for port holding but adds a background process.
-3. **pasta on Linux**: pasta provides a real network namespace — guest loopback works unconditionally and port detection is built in. Should Linux use pasta instead of TSI? Proxy architecture still works either way.
+2. **pasta on Linux**: pasta provides a real network namespace — guest loopback works unconditionally and port detection is built in. Should Linux use pasta instead of TSI? Proxy architecture still works either way.
 
 ---
 

@@ -15,15 +15,11 @@ import (
 )
 
 var createCmd = &cobra.Command{
-	Use:   "create [image]",
-	Short: "Create an ext4-backed workspace without starting it",
-	Long: `Create a stopped microVM workspace by cloning a cached ext4 image.
-The first use of an OCI digest prepares its immutable disk template; subsequent
-creates clone one file and complete in milliseconds.
-
-Start the daemon before VMs when contested ports must be pre-empted.`,
-	Args: cobra.MaximumNArgs(1),
-	RunE: runCreate,
+	Use:    "create [image]",
+	Short:  "Create a stopped workspace",
+	Hidden: true,
+	Args:   cobra.MaximumNArgs(1),
+	RunE:   runCreate,
 }
 
 var (
@@ -56,6 +52,9 @@ func doCreate(name, image string, cpus, memory int, ports []int, mount, userCmd 
 	if memory <= 0 {
 		return nil, fmt.Errorf("memory must be greater than zero")
 	}
+	if err := validatePorts(ports); err != nil {
+		return nil, err
+	}
 	if err := vm.CheckRuntime(); err != nil {
 		return nil, err
 	}
@@ -82,7 +81,7 @@ func doCreate(name, image string, cpus, memory int, ports []int, mount, userCmd 
 		return nil, fmt.Errorf("workspace %q already exists", name)
 	}
 
-	sshPort, err := db.NextSSHPort(database)
+	sshPort, err := nextAvailableSSHPort(database)
 	if err != nil {
 		return nil, fmt.Errorf("allocate ssh port: %w", err)
 	}
@@ -178,9 +177,6 @@ func doCreate(name, image string, cpus, memory int, ports []int, mount, userCmd 
 	}
 
 	success = true
-	fmt.Printf("INFO Workspace %q created (stopped). Use 'devd start %s' to boot.\n", name, name)
-	fmt.Printf("     Disk: %s\n", diskPath)
-	fmt.Printf("     SSH port: %d, Relay port: %d\n", sshPort, relayPort)
 	return ws, nil
 }
 
@@ -190,21 +186,30 @@ func runCreate(cmd *cobra.Command, args []string) error {
 		image = args[0]
 	}
 
-	if dc, _ := config.LoadDevContainer("."); dc != nil {
+	dc, err := config.LoadDevContainer(".")
+	if err != nil {
+		return err
+	}
+	if dc != nil {
 		if len(args) == 0 && dc.Image != "" {
 			image = dc.Image
 		}
 		if len(createPorts) == 0 && len(dc.ForwardPorts) > 0 {
 			createPorts = dc.ForwardPorts
 		}
-		if createUserCmd == "" && dc.PostCreateCommand != "" {
-			createUserCmd = dc.PostCreateCommand
+		if dc.PostCreateCommand != "" {
+			fmt.Println("WARN devcontainer postCreateCommand is not supported yet")
 		}
 		if createMount == "" {
 			createMount = ".:/workspace"
 		}
 	}
 
-	_, err := doCreate(createName, image, createCPUs, createMemory, createPorts, createMount, createUserCmd)
-	return err
+	ws, err := doCreate(createName, image, createCPUs, createMemory, createPorts, createMount, createUserCmd)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("INFO Workspace %q created (stopped)\n", ws.Name)
+	fmt.Printf("     Start: devd start %s\n", ws.Name)
+	return nil
 }

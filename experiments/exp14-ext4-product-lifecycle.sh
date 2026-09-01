@@ -39,7 +39,7 @@ source_hostkey=$("${ssh_cmd[@]}" -p 2222 root@127.0.0.1 cat /etc/ssh/ssh_host_ed
 bin/devd stop exp14-source
 
 started=$(python3 -c 'import time; print(time.monotonic_ns())')
-bin/devd run --name exp14-child --fork exp14-source
+bin/devd fork exp14-source --name exp14-child
 fork_ms=$(python3 -c "import time; print((time.monotonic_ns() - $started) // 1000000)")
 child_machine=$("${ssh_cmd[@]}" -p 2223 root@127.0.0.1 cat /etc/machine-id)
 child_hostkey=$("${ssh_cmd[@]}" -p 2223 root@127.0.0.1 cat /etc/ssh/ssh_host_ed25519_key.pub)

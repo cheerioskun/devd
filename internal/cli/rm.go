@@ -7,6 +7,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"devd/internal/db"
+	"devd/internal/vm"
 )
 
 var rmCmd = &cobra.Command{
@@ -35,6 +36,13 @@ func runRm(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	if ws.State == "running" && !vm.IsRunning(ws.PID) {
+		if err := db.SetWorkspaceState(database, name, "stopped", 0); err != nil {
+			return fmt.Errorf("reconcile workspace state: %w", err)
+		}
+		ws.State = "stopped"
+		ws.PID = 0
+	}
 	if ws.State == "running" {
 		if !flagForce {
 			return fmt.Errorf("workspace %q is running — use -f to force remove", name)
@@ -56,6 +64,9 @@ func runRm(cmd *cobra.Command, args []string) error {
 	}
 	if err := updateSSHConfig(database); err != nil {
 		fmt.Printf("WARN update ssh config: %v\n", err)
+	}
+	if ports, portsErr := db.GetAllReservedPorts(database); portsErr == nil && len(ports) == 0 {
+		shutdownProxyDaemon()
 	}
 	fmt.Printf("INFO Workspace %q removed\n", name)
 	return nil
