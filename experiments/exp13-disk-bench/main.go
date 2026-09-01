@@ -1,3 +1,5 @@
+//go:build linux
+
 // exp13-disk-bench measures storage operations from inside a Linux guest.
 // It intentionally uses only the Go standard library so it can be cross-built
 // as a static linux/arm64 binary from macOS.
@@ -245,7 +247,7 @@ func main() {
 }
 
 func dropCaches() bool {
-	_ = syscall.Sync()
+	syscall.Sync()
 	return os.WriteFile("/proc/sys/vm/drop_caches", []byte("3\n"), 0o200) == nil
 }
 

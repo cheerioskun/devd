@@ -41,8 +41,8 @@ cp "$root/LICENSE" "$stage/LICENSE"
 "$stage/devd" version
 case $platform in
   Darwin)
-    [[ $(file "$stage/devd-vm") == *"Mach-O 64-bit $arch executable"* ]] || {
-      echo "ERROR: devd-vm has the wrong architecture" >&2
+    [[ $(lipo -archs "$stage/devd-vm") == "$arch" ]] || {
+      echo "ERROR: devd-vm has the wrong architecture: $(file "$stage/devd-vm")" >&2
       exit 1
     }
     codesign --verify --strict "$stage/devd-vm"
