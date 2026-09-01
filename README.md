@@ -187,16 +187,21 @@ When you create a workspace, `Host devd-<name>` appears in your SSH config. When
 
 ## Performance
 
-Measured on macOS ARM64 with libkrun 1.19.4 and `nicolaka/netshoot` ([experiments 12–14](experiments/exp14-ext4-product-lifecycle.md)):
+Measured on macOS ARM64 with libkrun 1.19.4 and `nicolaka/netshoot` ([product benchmark](BENCHMARK.md), [experiments 12–14](experiments/exp14-ext4-product-lifecycle.md)):
 
 | Metric | Value | Notes |
 |--------|-------|-------|
-| Boot (start → SSH ready) | **~0.2–0.45s** | ext4 root to SSH readiness on a warmed system |
-| Cold OCI → ext4 template | ~9.1s | One-time per image digest; cached afterward |
-| Cached workspace create | **15–24ms** | Clone one ext4 disk file on APFS |
-| Stopped workspace fork | **~19ms** | Clone the source workspace disk |
-| Switch latency | <200ms | Next connection routes to new workspace |
-| Guest loopback | Isolated | Each VM reaches its own server |
+| Cached `run` → authenticated SSH p95 | **423ms** | complete user-visible operation |
+| Stopped `start` → authenticated SSH p95 | **278ms** | complete user-visible operation |
+| `fork` → authenticated SSH p95 | **510ms** | clone, fresh identity, and boot |
+| Cold OCI → ext4 template | ~9.1s | one-time per image digest; cached afterward |
+| APFS disk clone | **15–24ms** | one copy-on-write ext4 file clone |
+| Warm switch → correct response p95 | **40ms** | next connection, both tunnels warm |
+| Idle RSS | **~207 MiB/VM** | separate kernel, 512 MiB guest allocation |
+| Guest loopback | Isolated | each VM reaches its own server |
+
+Run `bash benchmark.sh` for the acceptance benchmark and
+`bash test-functional.sh` for the hardware-backed correctness suite.
 
 ## Project Structure
 

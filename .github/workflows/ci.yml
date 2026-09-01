@@ -31,7 +31,7 @@ jobs:
         run: go build ./cmd/devd
 
       - name: Check shell syntax
-        run: bash -n install.sh scripts/* test-functional.sh experiments/*.sh
+        run: bash -n install.sh scripts/* benchmark.sh test-functional.sh experiments/*.sh
 
   macos-bundle:
     runs-on: macos-15

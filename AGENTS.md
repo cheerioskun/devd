@@ -35,7 +35,7 @@ Do **not** use `git commit`, `git add`, `git checkout`, `git reset`, or `git sta
 
 1. **No CGO in Go.** Ever. Use `modernc.org/sqlite`; shell out to the separately linked `devd-vm` companion. Do not link C libraries into the Go binary.
 2. **No `krun_set_port_map`.** It breaks guest loopback. See `SPEC.md` appendix.
-3. **Daemon must pre-empt contested ports before VMs start.** Ordering matters. See `SPEC.md` networking section.
+3. **The automatic proxy must pre-empt every declared port before its VM starts.** This preserves guest loopback and makes later sharing safe. See `SPEC.md` networking section.
 4. **gofmt only.** No other formatters. Pre-commit hooks enforce `gofmt`, `govet`, `golangci-lint`.
 
 ## Dev environment: devenv (Nix)
@@ -97,14 +97,16 @@ defer database.Close()
 - `devd-vm` process liveness owns actual VM state; devd reconciles with `vm.IsRunning`
 - Runtime files live under `~/.devd/workspaces/<name>/` (ext4 disk, config, VM log)
 - Immutable digest-addressed templates live under `~/.devd/images/`
-- SSH ports start at 2222, relay ports at 9001; both allocated as `MAX(col) + 1`
+- SSH ports start at 2222, advance from `MAX(ssh_port) + 1`, and skip ports already bound on the host
+- `relay_port` remains in schema v2 for compatibility but routing now uses short OpenSSH stream-local sockets
 
 ## Testing
 
-No tests exist yet. When adding them:
-- Standard `testing` package, table-driven, files alongside source
-- `db` and `ssh/config.go` are the easiest to unit test (no external deps beyond filesystem)
-- Full VM/storage integration needs the runtime companion and libkrun â€” guard with `testing.Short()` or build tags
+- Unit tests use the standard `testing` package and live beside source; run `test` or `go test ./...`
+- `check` is the required formatting, vet, lint, and unit-test gate
+- `bash test-functional.sh` is the isolated hardware-backed product regression suite
+- `bash benchmark.sh` enforces the user-visible latency and idle-RSS envelope documented in `BENCHMARK.md`
+- Full VM/storage tests require the runtime companions, libkrun, Buildah, and e2fsprogs; keep them out of `go test ./...`
 
 ## Experiments
 
@@ -128,7 +130,7 @@ The `experiments/` directory contains empirical validation of design decisions â
 | exp11      | `devd-vm` C prototype and directory-clone baseline |
 | exp12      | APFS-cloned ext4 root disks: metadata, identity, isolation, persistence, recovery |
 | exp13      | ext4 guest performance versus directory-root virtio-fs |
-| exp14      | Product ext4 create/run and `run --fork` lifecycle |
+| exp14      | Product ext4 run/start and `fork` lifecycle |
 
 ### When to add new experiments
 

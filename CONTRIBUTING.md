@@ -77,6 +77,7 @@ The `check` script runs the same validations as the git hooks plus `go test`.
 test                    # go test ./...
 check                   # gofmt + vet + lint + unit tests
 bash test-functional.sh # hardware-backed end-to-end product regression
+bash benchmark.sh       # user-visible performance acceptance benchmark
 ```
 
 The functional suite uses an isolated temporary state directory and exercises
@@ -89,6 +90,7 @@ immutable cache without reusing workspace state:
 DEVD_TEST_IMAGE_CACHE="$HOME/.devd/images" SKIP_BUILD=1 bash test-functional.sh
 ```
 
-For architecture and performance experiments, see `experiments/`. Each
-experiment includes a Markdown method, acceptance criteria, results, and
-conclusion.
+See [BENCHMARK.md](BENCHMARK.md) for benchmark boundaries, controls, acceptance
+rationale, and the current baseline. For architecture experiments, see
+`experiments/`. Each experiment includes a Markdown method, acceptance criteria,
+results, and conclusion.

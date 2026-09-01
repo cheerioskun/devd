@@ -11,6 +11,8 @@ DEVD="$ROOT/bin/devd"
 IMAGE=${IMAGE:-nicolaka/netshoot}
 STATE=$(mktemp -d "${TMPDIR:-/tmp}/devd-functional-state.XXXXXX")
 PROJECT=$(mktemp -d "${TMPDIR:-/tmp}/devd-functional-project.XXXXXX")
+STATE=$(cd "$STATE" && pwd -P)
+PROJECT=$(cd "$PROJECT" && pwd -P)
 PORT=${PORT:-$(python3 - <<'PY'
 import random
 import socket
