@@ -132,6 +132,7 @@ The `experiments/` directory contains empirical validation of design decisions â
 | exp12      | APFS-cloned ext4 root disks: metadata, identity, isolation, persistence, recovery |
 | exp13      | ext4 guest performance versus directory-root virtio-fs |
 | exp14      | Product ext4 run/start and `fork` lifecycle |
+| exp15      | Explicit per-VM kernels with ext4 root, initramfs, and custom cmdline |
 
 ### When to add new experiments
 
