@@ -20,7 +20,6 @@ import (
 const (
 	templateDiskName = "rootfs.ext4"
 	manifestName     = "manifest.json"
-	workspaceConfig  = "config.json"
 )
 
 // ImageManifest records immutable OCI and disk-format inputs for a cached
@@ -33,8 +32,6 @@ type ImageManifest struct {
 	FormatVersion int       `json:"format_version"`
 	Environment   []string  `json:"environment,omitempty"`
 	WorkingDir    string    `json:"working_dir,omitempty"`
-	Entrypoint    []string  `json:"entrypoint,omitempty"`
-	Command       []string  `json:"command,omitempty"`
 	CreatedAt     time.Time `json:"created_at"`
 }
 
@@ -46,20 +43,6 @@ type Template struct {
 	Cached   bool
 }
 
-// WorkspaceConfig stores instance behavior that is not part of the immutable
-// root disk template.
-type WorkspaceConfig struct {
-	Image         string   `json:"image"`
-	ImageDigest   string   `json:"image_digest"`
-	Environment   []string `json:"environment,omitempty"`
-	WorkingDir    string   `json:"working_dir,omitempty"`
-	UserCommand   string   `json:"user_command,omitempty"`
-	MountHost     string   `json:"mount_host,omitempty"`
-	MountGuest    string   `json:"mount_guest,omitempty"`
-	ParentName    string   `json:"parent_name,omitempty"`
-	FormatVersion int      `json:"format_version"`
-}
-
 type buildahInspect struct {
 	FromImage       string `json:"FromImage"`
 	FromImageID     string `json:"FromImageID"`
@@ -69,8 +52,6 @@ type buildahInspect struct {
 		Config       struct {
 			Env        []string `json:"Env"`
 			WorkingDir string   `json:"WorkingDir"`
-			Entrypoint []string `json:"Entrypoint"`
-			Cmd        []string `json:"Cmd"`
 		} `json:"config"`
 	} `json:"OCIv1"`
 }
@@ -144,11 +125,9 @@ func EnsureTemplate(image string) (*Template, error) {
 		Digest:        digest,
 		Architecture:  inspect.OCIv1.Architecture,
 		DiskMiB:       config.DefaultDiskMiB,
-		FormatVersion: config.DiskFormatVersion,
+		FormatVersion: config.TemplateFormatVersion,
 		Environment:   inspect.OCIv1.Config.Env,
 		WorkingDir:    inspect.OCIv1.Config.WorkingDir,
-		Entrypoint:    inspect.OCIv1.Config.Entrypoint,
-		Command:       inspect.OCIv1.Config.Cmd,
 		CreatedAt:     time.Now().UTC(),
 	}
 	if err := prepareTemplate(tempDir, canonical, manifest); err != nil {
@@ -340,28 +319,6 @@ func CloneDisk(source, destination string) error {
 	return syncDir(filepath.Dir(destination))
 }
 
-// WriteWorkspaceConfig atomically writes instance metadata.
-func WriteWorkspaceConfig(wsDir string, cfg WorkspaceConfig) error {
-	cfg.FormatVersion = config.DiskFormatVersion
-	return writeJSON(filepath.Join(wsDir, workspaceConfig), cfg, 0600)
-}
-
-// ReadWorkspaceConfig loads instance metadata.
-func ReadWorkspaceConfig(wsDir string) (*WorkspaceConfig, error) {
-	data, err := os.ReadFile(filepath.Join(wsDir, workspaceConfig))
-	if err != nil {
-		return nil, fmt.Errorf("read workspace config: %w", err)
-	}
-	var cfg WorkspaceConfig
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("decode workspace config: %w", err)
-	}
-	if cfg.FormatVersion != config.DiskFormatVersion {
-		return nil, fmt.Errorf("workspace disk format %d is unsupported (expected %d)", cfg.FormatVersion, config.DiskFormatVersion)
-	}
-	return &cfg, nil
-}
-
 func loadTemplate(dir string) (*Template, error) {
 	manifestData, err := os.ReadFile(filepath.Join(dir, manifestName))
 	if err != nil {
@@ -371,7 +328,7 @@ func loadTemplate(dir string) (*Template, error) {
 	if err := json.Unmarshal(manifestData, &manifest); err != nil {
 		return nil, err
 	}
-	if manifest.FormatVersion != config.DiskFormatVersion || manifest.DiskMiB != config.DefaultDiskMiB {
+	if manifest.FormatVersion != config.TemplateFormatVersion || manifest.DiskMiB != config.DefaultDiskMiB {
 		return nil, fmt.Errorf("template format mismatch")
 	}
 	disk := filepath.Join(dir, templateDiskName)
@@ -399,7 +356,7 @@ func lockTemplate(path string) (*os.File, error) {
 
 func templateKey(digest string) string {
 	digest = strings.ReplaceAll(digest, ":", "-")
-	return fmt.Sprintf("%s-%s-v%d-%dm", digest, imageArchitecture(), config.DiskFormatVersion, config.DefaultDiskMiB)
+	return fmt.Sprintf("%s-%s-v%d-%dm", digest, imageArchitecture(), config.TemplateFormatVersion, config.DefaultDiskMiB)
 }
 
 // QualifyImage applies Docker Hub semantics without relying on a host-wide

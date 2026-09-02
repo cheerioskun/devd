@@ -13,7 +13,8 @@ const (
 	DefaultMemory  = 512       // MB
 	DefaultDiskMiB = 32 * 1024 // sparse logical capacity
 
-	DiskFormatVersion = 1
+	TemplateFormatVersion = 1
+	WorkspaceSpecVersion  = 1
 
 	SSHPortBase   = 2222
 	RelayPortBase = 9001

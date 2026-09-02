@@ -11,6 +11,7 @@ import (
 	"devd/internal/db"
 	"devd/internal/storage"
 	"devd/internal/vm"
+	"devd/internal/workspace"
 )
 
 var forkCmd = &cobra.Command{
@@ -159,11 +160,11 @@ func doFork(sourceName, destinationName string, overrides forkOverrides) (*db.Wo
 		return nil, fmt.Errorf("workspace %q already exists", destinationName)
 	}
 
-	sourceCfg, err := storage.ReadWorkspaceConfig(source.WorkspaceDir)
+	sourceSpec, err := workspace.Load(source.WorkspaceDir)
 	if err != nil {
 		return nil, err
 	}
-	mountHost, mountGuest := sourceCfg.MountHost, sourceCfg.MountGuest
+	mountHost, mountGuest := sourceSpec.MountHost, sourceSpec.MountGuest
 	if overrides.MountChanged {
 		mountHost, mountGuest, err = parseMount(overrides.Mount)
 		if err != nil {
@@ -188,7 +189,7 @@ func doFork(sourceName, destinationName string, overrides forkOverrides) (*db.Wo
 	if cpus <= 0 || cpus > 255 || memory <= 0 {
 		return nil, fmt.Errorf("fork CPU and memory overrides must be positive (cpus <= 255)")
 	}
-	userCommand := sourceCfg.UserCommand
+	userCommand := sourceSpec.UserCommand
 	if overrides.UserCommandChanged {
 		userCommand = overrides.UserCommand
 	}
@@ -235,22 +236,15 @@ func doFork(sourceName, destinationName string, overrides forkOverrides) (*db.Wo
 	if err := storage.CloneDisk(source.DiskPath, diskPath); err != nil {
 		return nil, err
 	}
-	destinationCfg := *sourceCfg
-	destinationCfg.MountHost = mountHost
-	destinationCfg.MountGuest = mountGuest
-	destinationCfg.UserCommand = userCommand
-	destinationCfg.ParentName = sourceName
-	if err := storage.WriteWorkspaceConfig(wsDir, destinationCfg); err != nil {
+	destinationSpec := *sourceSpec
+	destinationSpec.MountHost = mountHost
+	destinationSpec.MountGuest = mountGuest
+	destinationSpec.UserCommand = userCommand
+	destinationSpec.ParentName = sourceName
+	if err := workspace.Save(wsDir, destinationSpec); err != nil {
 		return nil, err
 	}
-	if err := vm.WriteWorkspaceFiles(wsDir, vm.WorkspaceFilesOpts{
-		UserCommand:  userCommand,
-		ImageWorkdir: destinationCfg.WorkingDir,
-		MountGuest:   mountGuest,
-	}); err != nil {
-		return nil, err
-	}
-	if err := vm.MarkRegenerateIdentity(wsDir); err != nil {
+	if err := workspace.MarkRegenerateIdentity(wsDir); err != nil {
 		return nil, err
 	}
 

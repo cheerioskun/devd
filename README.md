@@ -212,6 +212,7 @@ internal/
   config/          Paths and defaults (~/.devd/)
   db/              SQLite state layer (pure Go, no CGO)
   storage/         OCI template cache + ext4 clone lifecycle
+  workspace/       Persistent workspace specs + guest control files
   vm/              devd-vm process wrapper + guest init
   ssh/             SSH keypair + ~/.ssh/config management
   proxy/           Automatic port pre-emption and routing

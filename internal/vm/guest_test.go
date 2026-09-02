@@ -1,35 +1,9 @@
 package vm
 
 import (
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 )
-
-func TestWriteWorkspaceFiles(t *testing.T) {
-	dir := t.TempDir()
-	if err := WriteWorkspaceFiles(dir, WorkspaceFilesOpts{
-		UserCommand:  "echo ready",
-		ImageWorkdir: "/workspace",
-		MountGuest:   "/workspace",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	for name, want := range map[string]string{
-		userCommandName:  "echo ready",
-		imageWorkdirName: "/workspace\n",
-		mountGuestName:   "/workspace\n",
-	} {
-		data, err := os.ReadFile(filepath.Join(dir, name))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if string(data) != want {
-			t.Errorf("%s = %q, want %q", name, data, want)
-		}
-	}
-}
 
 func TestGuestInitHasCleanShutdownAndIdentityFork(t *testing.T) {
 	for _, fragment := range []string{

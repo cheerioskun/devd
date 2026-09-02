@@ -83,7 +83,15 @@ func runRun(cmd *cobra.Command, args []string) error {
 		fmt.Printf("INFO Generated workspace name %q\n", name)
 	}
 
-	ws, err := doCreate(name, image, flagCPUs, flagMemory, flagPorts, mount, flagCmd)
+	ws, err := provisionWorkspace(provisionOptions{
+		Name:        name,
+		Image:       image,
+		CPUs:        flagCPUs,
+		Memory:      flagMemory,
+		Ports:       flagPorts,
+		Mount:       mount,
+		UserCommand: flagCmd,
+	})
 	if err != nil {
 		return err
 	}

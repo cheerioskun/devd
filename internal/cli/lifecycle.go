@@ -14,8 +14,8 @@ import (
 	"devd/internal/config"
 	"devd/internal/db"
 	"devd/internal/ssh"
-	"devd/internal/storage"
 	"devd/internal/vm"
+	"devd/internal/workspace"
 )
 
 func validatePorts(ports []int) error {
@@ -77,7 +77,7 @@ func startWorkspace(database *sql.DB, ws *db.Workspace) (time.Duration, error) {
 		}
 		return 0, fmt.Errorf("workspace disk %s: %w", ws.DiskPath, err)
 	}
-	workspaceCfg, err := storage.ReadWorkspaceConfig(ws.WorkspaceDir)
+	workspaceSpec, err := workspace.Load(ws.WorkspaceDir)
 	if err != nil {
 		return 0, err
 	}
@@ -87,10 +87,10 @@ func startWorkspace(database *sql.DB, ws *db.Workspace) (time.Duration, error) {
 	}
 
 	mounts := []vm.Mount{{Tag: "devd", HostPath: devdDir}}
-	if workspaceCfg.MountHost != "" {
-		mounts = append(mounts, vm.Mount{Tag: "workspace", HostPath: workspaceCfg.MountHost})
+	if workspaceSpec.MountHost != "" {
+		mounts = append(mounts, vm.Mount{Tag: "workspace", HostPath: workspaceSpec.MountHost})
 	}
-	environment := imageEnvironment(workspaceCfg.Environment)
+	environment := imageEnvironment(workspaceSpec.Environment)
 	environment = append(environment,
 		"HOME=/root",
 		"DEVD_NAME="+ws.Name,

@@ -18,27 +18,3 @@ func TestQualifyImage(t *testing.T) {
 		})
 	}
 }
-
-func TestWorkspaceConfigRoundTrip(t *testing.T) {
-	dir := t.TempDir()
-	input := WorkspaceConfig{
-		Image:       "docker.io/library/alpine",
-		ImageDigest: "sha256:abc",
-		Environment: []string{"PATH=/bin"},
-		WorkingDir:  "/root",
-		UserCommand: "echo ready",
-		MountHost:   "/tmp/project",
-		MountGuest:  "/workspace",
-		ParentName:  "parent",
-	}
-	if err := WriteWorkspaceConfig(dir, input); err != nil {
-		t.Fatal(err)
-	}
-	output, err := ReadWorkspaceConfig(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if output.ImageDigest != input.ImageDigest || output.ParentName != input.ParentName || output.MountGuest != input.MountGuest {
-		t.Fatalf("workspace config round trip = %#v", output)
-	}
-}

@@ -6,58 +6,7 @@ import (
 	"path/filepath"
 )
 
-const (
-	guestInitName           = "devd-init"
-	userCommandName         = "user-command"
-	imageWorkdirName        = "image-workdir"
-	mountGuestName          = "mount-guest"
-	regenerateIdentityName  = "regenerate-identity"
-	defaultGuestUserWorkdir = "/root"
-)
-
-// WorkspaceFilesOpts configures host-side files consumed by the generic guest
-// init after it mounts ~/.devd through virtio-fs.
-type WorkspaceFilesOpts struct {
-	UserCommand  string
-	ImageWorkdir string
-	MountGuest   string
-}
-
-// WriteWorkspaceFiles writes per-workspace configuration without modifying the
-// ext4 image. This keeps template cloning on the create hot path.
-func WriteWorkspaceFiles(wsDir string, opts WorkspaceFilesOpts) error {
-	workdir := opts.ImageWorkdir
-	if workdir == "" {
-		workdir = defaultGuestUserWorkdir
-	}
-
-	files := []struct {
-		name    string
-		content string
-		mode    os.FileMode
-	}{
-		{userCommandName, opts.UserCommand, 0600},
-		{imageWorkdirName, workdir + "\n", 0600},
-		{mountGuestName, opts.MountGuest + "\n", 0600},
-	}
-	for _, file := range files {
-		path := filepath.Join(wsDir, file.name)
-		if err := os.WriteFile(path, []byte(file.content), file.mode); err != nil {
-			return fmt.Errorf("write %s: %w", file.name, err)
-		}
-	}
-	return nil
-}
-
-// MarkRegenerateIdentity makes the next boot replace machine-id and SSH host
-// keys. Forked disks inherit both from their stopped parent and must diverge.
-func MarkRegenerateIdentity(wsDir string) error {
-	path := filepath.Join(wsDir, regenerateIdentityName)
-	if err := os.WriteFile(path, nil, 0600); err != nil {
-		return fmt.Errorf("mark identity regeneration: %w", err)
-	}
-	return nil
-}
+const guestInitName = "devd-init"
 
 // WriteGuestInit writes the generic init used in every immutable ext4 image.
 func WriteGuestInit(dir string) (string, error) {

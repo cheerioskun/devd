@@ -34,7 +34,6 @@ func Execute() error {
 func init() {
 	rootCmd.SetVersionTemplate("devd {{.Version}}\n")
 	rootCmd.AddCommand(versionCmd)
-	rootCmd.AddCommand(createCmd)
 	rootCmd.AddCommand(startCmd)
 	rootCmd.AddCommand(runCmd)
 	rootCmd.AddCommand(forkCmd)

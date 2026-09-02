@@ -5,10 +5,11 @@ devd: microVM-per-workspace dev environments. Go, no CGO. See `README.md` for us
 ## Orientation
 
 - Entry point: `cmd/devd/main.go` → `internal/cli/root.go`
-- One file per cobra command in `internal/cli/` (e.g., `create.go`, `ssh.go`, `daemon.go`)
-- `internal/cli/create.go` has `doCreate()` — shared by both `create` and `run` commands
+- One file per public cobra command in `internal/cli/` (e.g., `run.go`, `ssh.go`, `daemon.go`)
+- `internal/cli/provision.go` owns workspace provisioning used by the `run` command
 - `internal/db/db.go` — all queries and schema in one file
 - `internal/storage/storage.go` — digest cache, ext4 templates, reflink cloning
+- `internal/workspace/spec.go` — persistent workspace boot behavior and guest control files
 - `internal/vm/runtime.go` — shells out to the bundled `devd-vm` companion
 - `internal/proxy/proxy.go` — entire proxy daemon in one file
 - `internal/config/config.go` — path constants, defaults
@@ -84,7 +85,7 @@ defer database.Close()
 
 **Output** — `fmt.Printf("INFO ...")`, `fmt.Printf("WARN ...")`, `log.Printf("PROXY: ...")`. No structured logging library.
 
-**CLI flags** — package-level vars, registered in `init()`. Create-specific flags use `create*` prefix; others use `flag*`.
+**CLI flags** — package-level vars, registered in `init()`. Shared run flags use `flag*`; command-specific flags use the command name as their prefix.
 
 **Process detachment** — background `devd-vm` processes use `Setpgid: true` and `go cmd.Wait()`. Do not wait synchronously.
 
