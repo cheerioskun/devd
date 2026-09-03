@@ -1,6 +1,7 @@
 /*
- * Experiment 15 launcher: compare libkrunfw's implicit kernel with the same
- * kernel supplied explicitly through krun_set_kernel(). Not production code.
+ * Experiment 15 launcher: boot devd ext4 roots with libkrunfw's implicit
+ * kernel or an external kernel supplied through krun_set_kernel().
+ * Not production code.
  */
 #include <errno.h>
 #include <inttypes.h>
