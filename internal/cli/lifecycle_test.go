@@ -6,6 +6,35 @@ import (
 	"testing"
 )
 
+func TestResolveKernelPath(t *testing.T) {
+	if path, err := resolveKernelPath(""); err != nil || path != "" {
+		t.Fatalf("resolve empty kernel path = %q, %v", path, err)
+	}
+
+	dir := t.TempDir()
+	kernel := filepath.Join(dir, "Image")
+	if err := os.WriteFile(kernel, []byte("not validated by design"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	path, err := resolveKernelPath(kernel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := filepath.EvalSymlinks(kernel)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if path != want {
+		t.Fatalf("resolved kernel path = %q, want %q", path, want)
+	}
+
+	for _, value := range []string{filepath.Join(dir, "missing"), dir} {
+		if _, err := resolveKernelPath(value); err == nil {
+			t.Errorf("resolveKernelPath(%q) unexpectedly succeeded", value)
+		}
+	}
+}
+
 func TestValidatePorts(t *testing.T) {
 	if err := validatePorts([]int{80, 443, 8080}); err != nil {
 		t.Fatal(err)

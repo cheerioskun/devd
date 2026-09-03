@@ -32,6 +32,7 @@ var (
 	forkMount   string
 	forkNoMount bool
 	forkUserCmd string
+	forkKernel  string
 )
 
 func init() {
@@ -42,6 +43,7 @@ func init() {
 	forkCmd.Flags().StringVar(&forkMount, "mount", "", "override host:guest volume mount")
 	forkCmd.Flags().BoolVar(&forkNoMount, "no-mount", false, "do not reuse the source host mount")
 	forkCmd.Flags().StringVar(&forkUserCmd, "cmd", "", "override startup command")
+	forkCmd.Flags().StringVar(&forkKernel, "kernel", "", "override custom kernel (empty uses embedded kernel)")
 }
 
 func runFork(cmd *cobra.Command, args []string) error {
@@ -75,6 +77,8 @@ func runFork(cmd *cobra.Command, args []string) error {
 		MountChanged:       mountChanged,
 		UserCommand:        forkUserCmd,
 		UserCommandChanged: cmd.Flags().Changed("cmd"),
+		KernelPath:         forkKernel,
+		KernelPathChanged:  cmd.Flags().Changed("kernel"),
 	})
 	if err != nil {
 		return err
@@ -108,6 +112,8 @@ type forkOverrides struct {
 	MountChanged       bool
 	UserCommand        string
 	UserCommandChanged bool
+	KernelPath         string
+	KernelPathChanged  bool
 }
 
 // doFork creates a stopped destination record and disk. The fork command
@@ -193,6 +199,13 @@ func doFork(sourceName, destinationName string, overrides forkOverrides) (*db.Wo
 	if overrides.UserCommandChanged {
 		userCommand = overrides.UserCommand
 	}
+	kernelPath := sourceSpec.KernelPath
+	if overrides.KernelPathChanged {
+		kernelPath, err = resolveKernelPath(overrides.KernelPath)
+		if err != nil {
+			return nil, err
+		}
+	}
 	reservedPorts, err := db.GetReservedPorts(database, sourceName)
 	if err != nil {
 		return nil, fmt.Errorf("read source ports: %w", err)
@@ -240,6 +253,7 @@ func doFork(sourceName, destinationName string, overrides forkOverrides) (*db.Wo
 	destinationSpec.MountHost = mountHost
 	destinationSpec.MountGuest = mountGuest
 	destinationSpec.UserCommand = userCommand
+	destinationSpec.KernelPath = kernelPath
 	destinationSpec.ParentName = sourceName
 	if err := workspace.Save(wsDir, destinationSpec); err != nil {
 		return nil, err

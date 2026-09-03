@@ -18,6 +18,28 @@ import (
 	"devd/internal/workspace"
 )
 
+func resolveKernelPath(value string) (string, error) {
+	if value == "" {
+		return "", nil
+	}
+	path, err := filepath.Abs(value)
+	if err != nil {
+		return "", fmt.Errorf("resolve kernel path: %w", err)
+	}
+	path, err = filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve kernel path %q: %w", value, err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", fmt.Errorf("inspect kernel path: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("kernel path %q is not a regular file", value)
+	}
+	return path, nil
+}
+
 func validatePorts(ports []int) error {
 	seen := make(map[int]bool, len(ports))
 	for _, port := range ports {
@@ -112,14 +134,15 @@ func startWorkspace(database *sql.DB, ws *db.Workspace) (time.Duration, error) {
 		return 0, fmt.Errorf("start workspace %q: %w", ws.Name, err)
 	}
 	pid, err := vm.Start(vm.StartOpts{
-		DiskPath: ws.DiskPath,
-		CPUs:     ws.CPUs,
-		Memory:   ws.Memory,
-		Env:      environment,
-		Mounts:   mounts,
-		Command:  "/usr/local/sbin/devd-init",
-		Workdir:  "/",
-		LogFile:  logFile,
+		DiskPath:   ws.DiskPath,
+		CPUs:       ws.CPUs,
+		Memory:     ws.Memory,
+		Env:        environment,
+		Mounts:     mounts,
+		Command:    "/usr/local/sbin/devd-init",
+		Workdir:    "/",
+		LogFile:    logFile,
+		KernelPath: workspaceSpec.KernelPath,
 	})
 	if err != nil {
 		return 0, fmt.Errorf("start VM: %w", err)
@@ -145,6 +168,9 @@ func startWorkspace(database *sql.DB, ws *db.Workspace) (time.Duration, error) {
 
 	fmt.Printf("INFO Waiting for SSH on port %d...\n", ws.SSHPort)
 	if err := waitForSSH(ws.SSHPort, pid, 30*time.Second); err != nil {
+		if workspaceSpec.KernelPath != "" && vm.IsRunning(pid) {
+			return 0, fmt.Errorf("workspace %q did not reach SSH with custom kernel: %w (VM left running; check log: %s; stop with: devd stop %s)", ws.Name, err, logFile, ws.Name)
+		}
 		stopAfterFailure()
 		if stateErr := db.SetWorkspaceState(database, ws.Name, "stopped", 0); stateErr != nil {
 			fmt.Printf("WARN update state after startup failure: %v\n", stateErr)

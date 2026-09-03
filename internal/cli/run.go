@@ -31,6 +31,7 @@ var (
 	flagMount   string
 	flagNoMount bool
 	flagCmd     string
+	flagKernel  string
 )
 
 func init() {
@@ -41,6 +42,7 @@ func init() {
 	runCmd.Flags().StringVar(&flagMount, "mount", "", "host:guest volume mount (default: .:/workspace)")
 	runCmd.Flags().BoolVar(&flagNoMount, "no-mount", false, "do not mount the current directory")
 	runCmd.Flags().StringVar(&flagCmd, "cmd", "", "startup command to run after each boot")
+	runCmd.Flags().StringVar(&flagKernel, "kernel", "", "host path to a custom kernel")
 }
 
 func runRun(cmd *cobra.Command, args []string) error {
@@ -91,6 +93,7 @@ func runRun(cmd *cobra.Command, args []string) error {
 		Ports:       flagPorts,
 		Mount:       mount,
 		UserCommand: flagCmd,
+		KernelPath:  flagKernel,
 	})
 	if err != nil {
 		return err

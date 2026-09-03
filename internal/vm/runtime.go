@@ -68,15 +68,16 @@ func companionPath(envName, name string) (string, error) {
 
 // StartOpts configures one ext4-root workspace VM.
 type StartOpts struct {
-	DiskPath string
-	CPUs     int
-	Memory   int
-	Env      []string
-	Mounts   []Mount
-	Command  string
-	Args     []string
-	Workdir  string
-	LogFile  string
+	DiskPath   string
+	CPUs       int
+	Memory     int
+	Env        []string
+	Mounts     []Mount
+	Command    string
+	Args       []string
+	Workdir    string
+	LogFile    string
+	KernelPath string
 }
 
 // Start launches an ext4-root VM in the background and returns its VMM PID.
@@ -93,6 +94,9 @@ func Start(opts StartOpts) (int, error) {
 	}
 
 	args := []string{"--disk", opts.DiskPath}
+	if opts.KernelPath != "" {
+		args = append(args, "--kernel", opts.KernelPath)
+	}
 	args = appendVMConfig(args, opts.CPUs, opts.Memory, opts.Env, opts.Mounts, opts.Workdir)
 	args = append(args, "--", opts.Command)
 	args = append(args, opts.Args...)

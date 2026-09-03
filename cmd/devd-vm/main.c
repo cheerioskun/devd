@@ -31,6 +31,12 @@
 #define MAX_ENV 64
 #define PROG "devd-vm"
 
+#if defined(__x86_64__)
+#define DEVD_KERNEL_FORMAT KRUN_KERNEL_FORMAT_ELF
+#else
+#define DEVD_KERNEL_FORMAT KRUN_KERNEL_FORMAT_RAW
+#endif
+
 struct virtiofs_mount {
 	const char *tag;
 	const char *path;
@@ -40,6 +46,7 @@ struct vm_config {
 	const char *root_dir;
 	const char *disk_path;
 	const char *data_disk_path;
+	const char *kernel_path;
 	uint8_t cpus;
 	uint32_t mem_mib;
 	const char *workdir;
@@ -64,6 +71,7 @@ static void usage(void)
 		"  --disk <path>         Workspace root disk (raw ext4)\n"
 		"  --helper-root <dir>   Internal image-conversion helper root\n"
 		"  --data-disk <path>    Internal image-conversion target disk\n"
+		"  --kernel <path>       External kernel (raw arm64 Image, ELF on x86_64)\n"
 		"  --cpus <n>            vCPUs (default: 2)\n"
 		"  --mem <n>             RAM in MiB (default: 512)\n"
 		"  --virtiofs <tag:path> Add virtio-fs mount (max %d, repeatable)\n"
@@ -120,6 +128,8 @@ static bool parse_args(int argc, char **argv, struct vm_config *cfg)
 			cfg->disk_path = argv[++i];
 		} else if (strcmp(argv[i], "--data-disk") == 0 && i + 1 < argc) {
 			cfg->data_disk_path = argv[++i];
+		} else if (strcmp(argv[i], "--kernel") == 0 && i + 1 < argc) {
+			cfg->kernel_path = argv[++i];
 		} else if (strcmp(argv[i], "--cpus") == 0 && i + 1 < argc) {
 			cfg->cpus = (uint8_t)atoi(argv[++i]);
 		} else if (strcmp(argv[i], "--mem") == 0 && i + 1 < argc) {
@@ -214,6 +224,12 @@ int main(int argc, char **argv)
 
 	KRUN_CHECK(krun_set_vm_config(ctx_id, cfg.cpus, cfg.mem_mib),
 		   "krun_set_vm_config");
+
+	if (cfg.kernel_path) {
+		KRUN_CHECK(krun_set_kernel(ctx_id, cfg.kernel_path,
+				      DEVD_KERNEL_FORMAT, NULL, NULL),
+			   "krun_set_kernel");
+	}
 
 	if (cfg.root_dir) {
 		KRUN_CHECK(krun_set_root(ctx_id, cfg.root_dir),

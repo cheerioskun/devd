@@ -30,6 +30,7 @@ type Spec struct {
 	UserCommand string   `json:"user_command,omitempty"`
 	MountHost   string   `json:"mount_host,omitempty"`
 	MountGuest  string   `json:"mount_guest,omitempty"`
+	KernelPath  string   `json:"kernel_path,omitempty"`
 	ParentName  string   `json:"parent_name,omitempty"`
 }
 

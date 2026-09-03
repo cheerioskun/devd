@@ -16,6 +16,7 @@ func TestSpecRoundTripAndGuestFiles(t *testing.T) {
 		UserCommand: "echo ready",
 		MountHost:   "/tmp/project",
 		MountGuest:  "/workspace",
+		KernelPath:  "/tmp/kernel",
 		ParentName:  "parent",
 	}
 	if err := Save(dir, input); err != nil {
@@ -25,7 +26,7 @@ func TestSpecRoundTripAndGuestFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if output.ImageDigest != input.ImageDigest || output.ParentName != input.ParentName || output.MountGuest != input.MountGuest {
+	if output.ImageDigest != input.ImageDigest || output.ParentName != input.ParentName || output.MountGuest != input.MountGuest || output.KernelPath != input.KernelPath {
 		t.Fatalf("workspace spec round trip = %#v", output)
 	}
 

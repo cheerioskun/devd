@@ -134,6 +134,24 @@ devd rm [-f] <name>                 Remove a workspace and its disk
 The positional argument to `run` is always an OCI image. `run` always creates a
 new workspace; `start` is the explicit counterpart to `stop`.
 
+A workspace can persistently use an external kernel instead of libkrunfw's
+embedded default:
+
+```bash
+devd run nicolaka/netshoot -n kernel-test --kernel ./arch/arm64/boot/Image
+devd stop kernel-test
+devd start kernel-test                 # reuses the custom kernel
+devd fork kernel-test -n kernel-next   # inherits it
+devd fork kernel-test -n stock --kernel=  # returns the child to the embedded kernel
+```
+
+The path is resolved to an absolute host path and stored in the workspace spec.
+On arm64 it must be a raw Linux `Image`; on x86_64 it must be an ELF kernel.
+devd deliberately does not inspect kernel configuration or compatibility. A
+custom kernel that cannot provide devd's guest drivers or TSI-backed SSH may
+fail to become ready; if its VM remains alive, inspect `devd logs <name>` and
+stop it with `devd stop <name>`.
+
 ### Flags
 
 | Flag | Commands | Description |
@@ -145,6 +163,7 @@ new workspace; `start` is the explicit counterpart to `stop`.
 | `--mount` | run, fork | Host:guest volume (e.g. `.:/workspace`) |
 | `--no-mount` | run, fork | Disable the default/inherited host mount |
 | `--cmd` | run, fork | Startup command run after each boot |
+| `--kernel` | run, fork | Host path to a custom kernel; inherited by forks |
 | `-f` | rm | Stop a running workspace before removal |
 | `-a` | ps | Include stopped workspaces |
 

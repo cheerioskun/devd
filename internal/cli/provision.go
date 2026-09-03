@@ -21,6 +21,7 @@ type provisionOptions struct {
 	Ports       []int
 	Mount       string
 	UserCommand string
+	KernelPath  string
 }
 
 func provisionWorkspace(opts provisionOptions) (*db.Workspace, error) {
@@ -44,6 +45,10 @@ func provisionWorkspace(opts provisionOptions) (*db.Workspace, error) {
 	}
 
 	mountHost, mountGuest, err := parseMount(opts.Mount)
+	if err != nil {
+		return nil, err
+	}
+	kernelPath, err := resolveKernelPath(opts.KernelPath)
 	if err != nil {
 		return nil, err
 	}
@@ -120,6 +125,7 @@ func provisionWorkspace(opts provisionOptions) (*db.Workspace, error) {
 		UserCommand: opts.UserCommand,
 		MountHost:   mountHost,
 		MountGuest:  mountGuest,
+		KernelPath:  kernelPath,
 	}
 	if err := workspace.Save(wsDir, workspaceSpec); err != nil {
 		return nil, err
