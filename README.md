@@ -32,7 +32,11 @@ myapp  docker.io/nicolaka/netshoot  running  2222      2     512 MB  *       5m 
 
 ## What is devd?
 
-devd runs each development workspace in its own microVM using [libkrun](https://github.com/containers/libkrun). Each workspace root is one writable ext4 disk, APFS-cloned (or reflinked on Linux) from an immutable OCI template. By default, the current directory stays on the host and is mounted at `/workspace` through virtio-fs. Each workspace gets its own Linux kernel, persistent disk, full isolation, and near-native performance — without Docker Desktop or a hidden background VM.
+devd runs each development workspace in its own microVM using [libkrun](https://github.com/containers/libkrun). Each workspace root is one writable ext4 disk, APFS-cloned (or reflinked on Linux) from an immutable OCI template. By default, the current directory stays on the host and is mounted at `/workspace` through virtio-fs. Each workspace gets its own Linux kernel, persistent disk, and near-native performance — without Docker Desktop or a hidden background VM.
+
+Guest disks and kernels are separate, but explicitly mounted host projects remain
+shared. Networking isolation also depends on declared-port pre-emption; undeclared
+ports retain TSI's host-network behavior.
 
 The current runtime requires images to contain OpenSSH server utilities. A
 general-purpose default image and image-independent guest agent are planned;
@@ -152,6 +156,21 @@ custom kernel that cannot provide devd's guest drivers or TSI-backed SSH may
 fail to become ready; if its VM remains alive, inspect `devd logs <name>` and
 stop it with `devd stop <name>`.
 
+### Lifecycle safety and upgrades
+
+Concurrent operations on the same workspace fail with a busy error; unrelated
+workspaces can boot concurrently. Fork locks its stopped source while cloning.
+A failed stop blocks forced removal, and a failed boot does not take over active
+shared-port routing. Guest management files live in a narrowly scoped control
+export—never the global devd directory—and SSH accepts keys, not passwords.
+
+**Stop running workspaces with your previous devd binary before upgrading.**
+Stopped version-1 workspace specs upgrade to version 2 on their next boot, using
+the current host-supplied init rather than an old script inside the disk. Mixing
+binary versions or downgrading upgraded workspaces is unsupported. If a crash
+leaves a workspace directory without a database record, devd preserves it and
+refuses to reuse that name until you explicitly recover or remove the directory.
+
 ### Flags
 
 | Flag | Commands | Description |
@@ -227,12 +246,12 @@ Run `bash benchmark.sh` for the acceptance benchmark and
 ```
 cmd/devd/          CLI entrypoint (cobra)
 internal/
-  cli/             Command implementations
+  cli/             Commands, option resolution, shared lifecycle + publication
   config/          Paths and defaults (~/.devd/)
   db/              SQLite state layer (pure Go, no CGO)
   storage/         OCI template cache + ext4 clone lifecycle
-  workspace/       Persistent workspace specs + guest control files
-  vm/              devd-vm process wrapper + guest init
+  workspace/       Operation locks, authoritative specs, rendered guest inputs
+  vm/              Companion adapter, process identities, current guest init
   ssh/             SSH keypair + ~/.ssh/config management
   proxy/           Automatic port pre-emption and routing
 cmd/devd-vm/       separately linked libkrun runtime companion

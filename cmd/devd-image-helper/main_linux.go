@@ -83,9 +83,6 @@ func run() error {
 		}
 	}
 
-	if err := installGuestInit(); err != nil {
-		return err
-	}
 	if err := sanitizeIdentity(); err != nil {
 		return err
 	}
@@ -261,26 +258,6 @@ func copyXattrs(source, target string) error {
 		if err := unix.Lsetxattr(target, name, value, 0); err != nil {
 			return fmt.Errorf("write xattr %s on %s: %w", name, target, err)
 		}
-	}
-	return nil
-}
-
-func installGuestInit() error {
-	target := filepath.Join(targetDir, "usr/local/sbin/devd-init")
-	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-		return fmt.Errorf("create guest init directory: %w", err)
-	}
-	if err := os.RemoveAll(target); err != nil {
-		return fmt.Errorf("replace guest init: %w", err)
-	}
-	if err := copyRegular("/devd-init", target); err != nil {
-		return fmt.Errorf("install guest init: %w", err)
-	}
-	if err := os.Chown(target, 0, 0); err != nil {
-		return fmt.Errorf("chown guest init: %w", err)
-	}
-	if err := os.Chmod(target, 0o755); err != nil {
-		return fmt.Errorf("chmod guest init: %w", err)
 	}
 	return nil
 }

@@ -9,6 +9,7 @@ import (
 
 	"devd/internal/config"
 	"devd/internal/db"
+	"devd/internal/workspace"
 )
 
 var runCmd = &cobra.Command{
@@ -52,6 +53,7 @@ func runRun(cmd *cobra.Command, args []string) error {
 		image = args[0]
 	}
 
+	ports := flagPorts
 	devContainer, err := config.LoadDevContainer(".")
 	if err != nil {
 		return err
@@ -61,7 +63,7 @@ func runRun(cmd *cobra.Command, args []string) error {
 			image = devContainer.Image
 		}
 		if !cmd.Flags().Changed("ports") && len(devContainer.ForwardPorts) > 0 {
-			flagPorts = devContainer.ForwardPorts
+			ports = devContainer.ForwardPorts
 		}
 		if devContainer.PostCreateCommand != "" {
 			fmt.Println("WARN devcontainer postCreateCommand is not supported yet")
@@ -85,12 +87,22 @@ func runRun(cmd *cobra.Command, args []string) error {
 		fmt.Printf("INFO Generated workspace name %q\n", name)
 	}
 
-	ws, err := provisionWorkspace(provisionOptions{
+	unlock, err := workspace.Lock(name)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	database, err := db.Open()
+	if err != nil {
+		return fmt.Errorf("open database: %w", err)
+	}
+	defer database.Close()
+	ws, err := provisionWorkspace(database, provisionOptions{
 		Name:        name,
 		Image:       image,
 		CPUs:        flagCPUs,
 		Memory:      flagMemory,
-		Ports:       flagPorts,
+		Ports:       ports,
 		Mount:       mount,
 		UserCommand: flagCmd,
 		KernelPath:  flagKernel,
@@ -100,11 +112,6 @@ func runRun(cmd *cobra.Command, args []string) error {
 	}
 	createElapsed := time.Since(totalStart)
 
-	database, err := db.Open()
-	if err != nil {
-		return fmt.Errorf("open database: %w", err)
-	}
-	defer database.Close()
 	bootElapsed, err := startWorkspace(database, ws)
 	if err != nil {
 		return err

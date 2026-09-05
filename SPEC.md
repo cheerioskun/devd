@@ -108,7 +108,7 @@ The default sparse capacity is 32 GiB. Physical host space is consumed only by t
 ### OCI storage, explicit guest prerequisites
 
 devd resolves OCI images through Buildah, then boots only their cached ext4
-representation. The current injected init invokes `sshd`, `ssh-keygen`, and
+representation. The current host-supplied init invokes `sshd`, `ssh-keygen`, and
 basic shell utilities from the image, so storage compatibility is broader than
 boot compatibility. A general-purpose published default and an
 image-independent guest agent are required before claiming arbitrary-image
@@ -119,6 +119,97 @@ support.
 A stopped workspace forks by reflink-cloning its single ext4 file. The child preserves complete guest disk state but receives fresh ports, machine ID, and SSH host keys on first boot. Host-mounted project files are outside the disk and are reused or explicitly overridden; they are never implicitly copied.
 
 Live migration adds enormous complexity for dev workloads that do not need it. Portable migration exports the ext4 disk plus workspace JSON rather than serializing a host directory tree.
+
+### Workspace ownership and lifecycle
+
+The lifecycle remains ordinary Go functions in `internal/cli`, not a service
+framework. Commands own their DB connection and operation locks. Input resolution
+(`options.go`) precedes disk or metadata side effects; `run` and `fork` use the
+same staged publisher (`provision.go`). The runtime adapter owns subprocesses,
+not workspace policy.
+
+There are three distinct locks, each protecting a different resource:
+
+| Lock | Owner / lifetime | Protects |
+|---|---|---|
+| `locks/<name>.lock` | CLI, whole lifecycle operation | Check/use sequences across start, stop, fork, rm, switch, and reconciliation |
+| `metadata.lock` | CLI, short critical section | Schema initialization, port allocation/publication/reconciliation, shared keys, and SSH config refresh |
+| Root disk inode lock | `devd-vm`, whole process lifetime | Disk use even if the launching CLI crashes before updating SQLite |
+
+Workspace locks are acquired in sorted order, outside workspace directories,
+and never unlinked. Contention fails with a busy error. Fork holds both source
+and destination operation locks and holds the source disk lock while cloning.
+Unrelated workspaces can prepare and boot concurrently. Metadata locks are never
+held while waiting for a VM. The companion refuses an already-locked root disk;
+cloning and deletion also require exclusive ownership of that inode. The proxy
+holds the metadata lock across reading and applying port declarations, preventing
+an obsolete snapshot from releasing a newly pre-empted port. Last-port removal
+waits for daemon shutdown before releasing the metadata lock.
+
+Creation uses a uniquely owned staging directory, publishes complete files, then
+inserts the workspace and all port declarations in one SQLite transaction.
+Cleanup only removes files owned by that invocation. Existing directories without
+records are preserved and block name reuse; devd does not silently delete or
+adopt them. A crash during publication/removal can leave such an orphan for
+explicit recovery. This is recoverable ordering, not a transaction spanning the
+filesystem and SQLite.
+
+`process.json` records the VMM PID and OS process birth identity before launch
+returns. Reconciliation recovers launches whose CLI died before recording DB
+state and detects PID reuse. Linux includes the host boot ID and process start
+ticks; macOS uses the process start timestamp. Observation errors fail closed.
+Signals recheck identity before each escalation; this is not an atomic portable
+process-handle API. Proxy tunnels also verify the launch receipt and key their
+lifetime by process incarnation, with a unique socket path for every replacement. The independent disk lock is the final guard against using a
+live disk whose process receipt is missing.
+
+A launched workspace is recorded as running before waiting for authenticated SSH.
+Only successful readiness activates it for shared-port routing. A stop error
+never authorizes disk deletion or a false stopped-state update. The existing
+custom-kernel timeout diagnostic behavior remains: a live incompatible boot is
+left running, not activated, with log and stop instructions. `ps` reconciles under
+workspace locks; busy entries show their last recorded state. Interactive SSH
+releases the operation lock before opening the session.
+
+### Host configuration and guest inputs
+
+`config.json` owns kernel selection, environment, working directory, startup
+command, and host-mount configuration. SQLite owns image/digest/parent provenance,
+resource allocation, identity, port declarations, and cached process/routing
+state. Version 2 removes duplicated provenance fields from the spec. Guest control
+files are derived, not a second configuration store.
+
+Before boot, devd renders only these files into `workspaces/<name>/control/`:
+
+- current `devd-init` policy;
+- the SSH **public** key;
+- startup command, working directory, and guest mount destination;
+- an identity-regeneration request when needed.
+
+Only this control directory is exported as the `devd` virtio-fs device. Neither
+the workspace directory nor the global devd state directory is exported. The
+control export is writable but disposable: a stopped guest's symlinks and files
+are removed before rendering fresh inputs. Optional project mounts remain
+explicitly shared host data, not isolated disk state.
+
+libkrun still owns the `/init.krun` ext4 handoff. The launched guest command mounts
+`devd` at `/devd` and execs the current `/devd/devd-init`. Templates no longer inject
+bootstrap policy; old in-disk scripts are bypassed. Existing stopped disks thus
+receive bootstrap/security fixes on their next boot without image reconversion.
+The image must still supply a shell, mount utilities, OpenSSH, and account tools.
+SSH permits key authentication only; no shared root password is installed.
+
+Fork's durable host identity-regeneration intent is acknowledged only after
+readiness. Failed boots can safely repeat it. Guest changes to disposable inputs
+cannot clear the host's intent or alter the authoritative spec.
+
+Spec version 2 marks this boot protocol. Version 1 specs load and are upgraded
+before their next launch; old binaries reject version 2 on start. **Stop all VMs
+with the previous binary before upgrading.** A live legacy PID without a process
+receipt is not safe to identify or signal automatically. Mixing lifecycle commands
+from different binary versions or downgrading upgraded workspaces is unsupported.
+
+Validation and measured overhead: [experiment 16](experiments/exp16-workspace-ownership.md).
 
 ---
 
@@ -208,7 +299,7 @@ silently approximated with incorrect semantics.
 
 ## State: SQLite
 
-SQLite tracks workspace metadata and process state. The workspace ext4 file owns persistent guest state; PID liveness owns actual running state.
+SQLite tracks workspace metadata and cached process state. The workspace ext4 file owns persistent guest state; the process identity receipt and VMM disk lock establish actual runtime ownership.
 
 ```sql
 CREATE TABLE workspaces (

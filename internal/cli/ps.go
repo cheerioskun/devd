@@ -9,7 +9,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"devd/internal/db"
-	"devd/internal/vm"
+	"devd/internal/workspace"
 )
 
 var psCmd = &cobra.Command{
@@ -37,15 +37,20 @@ func runPs(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	// Reconcile state: check if PIDs are still alive
-	for _, ws := range workspaces {
-		if ws.State == "running" && !vm.IsRunning(ws.PID) {
-			if err := db.SetWorkspaceState(database, ws.Name, "stopped", 0); err != nil {
-				fmt.Printf("WARN reconcile %s: %v\n", ws.Name, err)
-			}
-			ws.State = "stopped"
-			ws.PID = 0
+	// Never overwrite a transition in progress with an observation from an old
+	// snapshot. Busy workspaces retain their last recorded state in this view.
+	for i, ws := range workspaces {
+		unlock, err := workspace.Lock(ws.Name)
+		if err != nil {
+			continue
 		}
+		current, err := loadWorkspace(database, ws.Name)
+		unlock()
+		if err != nil {
+			fmt.Printf("WARN reconcile %s: %v\n", ws.Name, err)
+			continue
+		}
+		workspaces[i] = current
 	}
 
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)

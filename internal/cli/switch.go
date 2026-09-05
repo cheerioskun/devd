@@ -6,6 +6,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"devd/internal/db"
+	"devd/internal/workspace"
 )
 
 var switchCmd = &cobra.Command{
@@ -20,6 +21,11 @@ processes are not interrupted.`,
 
 func runSwitch(cmd *cobra.Command, args []string) error {
 	name := args[0]
+	unlock, err := workspace.Lock(name)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 
 	database, err := db.Open()
 	if err != nil {
@@ -27,7 +33,7 @@ func runSwitch(cmd *cobra.Command, args []string) error {
 	}
 	defer database.Close()
 
-	ws, err := db.GetWorkspace(database, name)
+	ws, err := loadWorkspace(database, name)
 	if err != nil {
 		return err
 	}
@@ -37,7 +43,10 @@ func runSwitch(cmd *cobra.Command, args []string) error {
 	}
 
 	// Get current active for reporting
-	current, _ := db.GetActiveWorkspace(database)
+	current, err := db.GetActiveWorkspace(database)
+	if err != nil {
+		return err
+	}
 	if current != nil && current.Name == name {
 		fmt.Printf("INFO Workspace %q is already active\n", name)
 		return nil

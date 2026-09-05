@@ -31,7 +31,10 @@ jobs:
         run: go build ./cmd/devd
 
       - name: Check shell syntax
-        run: bash -n install.sh scripts/* benchmark.sh test-functional.sh experiments/*.sh
+        run: |
+          for script in install.sh scripts/* benchmark.sh test-functional.sh experiments/*.sh; do
+            bash -n "$script" || exit
+          done
 
   macos-bundle:
     runs-on: macos-15

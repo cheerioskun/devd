@@ -14,7 +14,7 @@ const (
 	DefaultDiskMiB = 32 * 1024 // sparse logical capacity
 
 	TemplateFormatVersion = 1
-	WorkspaceSpecVersion  = 1
+	WorkspaceSpecVersion  = 2
 
 	SSHPortBase   = 2222
 	RelayPortBase = 9001
@@ -112,20 +112,30 @@ func ImagesDir() (string, error) {
 	return imagesDir, nil
 }
 
-// WorkspaceDir returns ~/.devd/workspaces/<name>/, creating it if needed.
-func WorkspaceDir(name string) (string, error) {
-	if err := ValidateWorkspaceName(name); err != nil {
-		return "", err
-	}
+// WorkspacesDir returns the parent directory for workspace files and staging.
+func WorkspacesDir() (string, error) {
 	dir, err := DevdDir()
 	if err != nil {
 		return "", err
 	}
-	wsDir := filepath.Join(dir, "workspaces", name)
-	if err := os.MkdirAll(wsDir, 0700); err != nil {
+	dir = filepath.Join(dir, "workspaces")
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return "", err
 	}
-	return wsDir, nil
+	return dir, nil
+}
+
+// WorkspaceDir returns a workspace path without creating the workspace.
+// Only the lifecycle publisher may claim a new workspace directory.
+func WorkspaceDir(name string) (string, error) {
+	if err := ValidateWorkspaceName(name); err != nil {
+		return "", err
+	}
+	dir, err := WorkspacesDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, name), nil
 }
 
 // WorkspaceDiskPath returns the ext4 disk path for a workspace.

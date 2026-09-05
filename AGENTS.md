@@ -6,11 +6,15 @@ devd: microVM-per-workspace dev environments. Go, no CGO. See `README.md` for us
 
 - Entry point: `cmd/devd/main.go` → `internal/cli/root.go`
 - One file per public cobra command in `internal/cli/` (e.g., `run.go`, `ssh.go`, `daemon.go`)
-- `internal/cli/provision.go` owns workspace provisioning used by the `run` command
+- `internal/cli/options.go` resolves inputs and fork inheritance before side effects
+- `internal/cli/provision.go` owns the staged disk/spec/DB publisher shared by `run` and `fork`
+- `internal/cli/lifecycle.go` owns reconciliation, start/readiness/activation, and confirmed stop
 - `internal/db/db.go` — all queries and schema in one file
 - `internal/storage/storage.go` — digest cache, ext4 templates, reflink cloning
-- `internal/workspace/spec.go` — persistent workspace boot behavior and guest control files
+- `internal/workspace/spec.go` — authoritative boot specs and disposable guest inputs
+- `internal/workspace/lock.go` — fail-fast per-workspace operation locks, acquired before reading state
 - `internal/vm/runtime.go` — shells out to the bundled `devd-vm` companion
+- `internal/vm/process*.go` — durable launch receipts and OS process birth identities
 - `internal/proxy/proxy.go` — entire proxy daemon in one file
 - `internal/config/config.go` — path constants, defaults
 - Networking design rationale and TSI internals: `SPEC.md`
@@ -95,7 +99,12 @@ defer database.Close()
 
 - SQLite (`~/.devd/devd.db`) owns workspace metadata, port reservations, active workspace flag
 - One writable `rootfs.ext4` owns each workspace's persistent guest state
-- `devd-vm` process liveness owns actual VM state; devd reconciles with `vm.IsRunning`
+- `process.json` records PID + OS birth identity; `loadWorkspace` reconciles it under the workspace lock
+- The companion holds an exclusive root-disk inode lock for its entire lifetime; clone/removal also require it
+- Only `workspaces/<name>/control/` is exported to that guest; never export the global state directory
+- Spec v2 is authoritative; guest inputs and the current host-supplied init are rendered before each boot
+- Acquire workspace locks first, then the short DB metadata lock for publication/allocation/SSH config; never hold the metadata lock while waiting for a VM
+- Stop failure blocks deletion. Readiness, process liveness, and active routing are distinct
 - Runtime files live under `~/.devd/workspaces/<name>/` (ext4 disk, config, VM log)
 - Immutable digest-addressed templates live under `~/.devd/images/`
 - SSH ports start at 2222, advance from `MAX(ssh_port) + 1`, and skip ports already bound on the host
@@ -133,6 +142,7 @@ The `experiments/` directory contains empirical validation of design decisions �
 | exp13      | ext4 guest performance versus directory-root virtio-fs |
 | exp14      | Product ext4 run/start and `fork` lifecycle |
 | exp15      | Explicit per-VM kernels with ext4 root, initramfs, and custom cmdline |
+| exp16      | Workspace/disk ownership, scoped guest control, current host bootstrap, and lifecycle failure paths |
 
 ### When to add new experiments
 

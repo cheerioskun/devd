@@ -10,9 +10,9 @@
  *
  * Usage:
  *   devd-vm --disk /path/to/rootfs.ext4 --cpus 2 --mem 512 \
- *           --virtiofs devd:/home/user/.devd \
- *           --virtiofs ws:/home/user/project \
- *           -- /bin/sh /devd/workspaces/myapp/init.sh
+ *           --virtiofs devd:/home/user/.devd/workspaces/myapp/control \
+ *           --virtiofs workspace:/home/user/project \
+ *           -- /bin/sh -c 'mkdir -p /devd; mount -t virtiofs devd /devd; exec /bin/sh /devd/devd-init'
  *
  * The process blocks until the VM exits. devd manages it via PID + signals.
  *
@@ -25,6 +25,9 @@
 #include <string.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/file.h>
 #include <libkrun.h>
 
 #define MAX_VIRTIOFS 8
@@ -109,6 +112,18 @@ static bool parse_virtiofs(const char *arg, struct virtiofs_mount *m)
 	return true;
 }
 
+static uint32_t parse_number(const char *value, uint32_t min, uint32_t max)
+{
+	char *end;
+	errno = 0;
+	unsigned long number = strtoul(value, &end, 10);
+	if (errno || value[0] < '0' || value[0] > '9' || *end || number < min || number > max) {
+		fprintf(stderr, PROG ": invalid numeric option: %s\n", value);
+		exit(1);
+	}
+	return (uint32_t)number;
+}
+
 static bool parse_args(int argc, char **argv, struct vm_config *cfg)
 {
 	memset(cfg, 0, sizeof(*cfg));
@@ -131,9 +146,9 @@ static bool parse_args(int argc, char **argv, struct vm_config *cfg)
 		} else if (strcmp(argv[i], "--kernel") == 0 && i + 1 < argc) {
 			cfg->kernel_path = argv[++i];
 		} else if (strcmp(argv[i], "--cpus") == 0 && i + 1 < argc) {
-			cfg->cpus = (uint8_t)atoi(argv[++i]);
+			cfg->cpus = (uint8_t)parse_number(argv[++i], 1, UINT8_MAX);
 		} else if (strcmp(argv[i], "--mem") == 0 && i + 1 < argc) {
-			cfg->mem_mib = (uint32_t)atoi(argv[++i]);
+			cfg->mem_mib = parse_number(argv[++i], 1, UINT32_MAX);
 		} else if (strcmp(argv[i], "--virtiofs") == 0 && i + 1 < argc) {
 			if (cfg->fs_count >= MAX_VIRTIOFS) {
 				fprintf(stderr, PROG ": too many --virtiofs (max %d)\n", MAX_VIRTIOFS);
@@ -151,7 +166,7 @@ static bool parse_args(int argc, char **argv, struct vm_config *cfg)
 		} else if (strcmp(argv[i], "--workdir") == 0 && i + 1 < argc) {
 			cfg->workdir = argv[++i];
 		} else if (strcmp(argv[i], "--log-level") == 0 && i + 1 < argc) {
-			cfg->log_level = (uint32_t)atoi(argv[++i]);
+			cfg->log_level = parse_number(argv[++i], 0, 5);
 		} else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
 			usage();
 			exit(0);
@@ -210,6 +225,16 @@ int main(int argc, char **argv)
 	if (!parse_args(argc, argv, &cfg)) {
 		usage();
 		return 1;
+	}
+
+	/* Keep the descriptor open until process exit. This is independent of the
+	 * CLI's operation locks and survives a CLI crash before PID publication. */
+	if (cfg.disk_path) {
+		int disk_lock = open(cfg.disk_path, O_RDONLY | O_CLOEXEC);
+		if (disk_lock < 0 || flock(disk_lock, LOCK_EX | LOCK_NB) < 0) {
+			fprintf(stderr, PROG ": lock root disk %s: %s\n", cfg.disk_path, strerror(errno));
+			return 1;
+		}
 	}
 
 	if (cfg.log_level > 0)

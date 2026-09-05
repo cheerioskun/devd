@@ -10,7 +10,7 @@ import (
 
 	"devd/internal/config"
 	"devd/internal/db"
-	"devd/internal/vm"
+	"devd/internal/workspace"
 )
 
 var sshCmd = &cobra.Command{
@@ -53,15 +53,14 @@ func runSSH(cmd *cobra.Command, args []string) error {
 	}
 	defer database.Close()
 
-	ws, err := db.GetWorkspace(database, name)
+	unlock, err := workspace.Lock(name)
 	if err != nil {
 		return err
 	}
-	if ws.State == "running" && !vm.IsRunning(ws.PID) {
-		if err := db.SetWorkspaceState(database, name, "stopped", 0); err != nil {
-			return fmt.Errorf("reconcile workspace state: %w", err)
-		}
-		ws.State = "stopped"
+	ws, err := loadWorkspace(database, name)
+	unlock() // An interactive SSH session must not prevent stop/rm.
+	if err != nil {
+		return err
 	}
 	if ws.State != "running" {
 		return fmt.Errorf("workspace %q is stopped; run 'devd start %s' first", name, name)

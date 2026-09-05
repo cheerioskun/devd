@@ -1,8 +1,10 @@
 package cli
 
 import (
+	"database/sql"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"devd/internal/config"
@@ -24,61 +26,22 @@ type provisionOptions struct {
 	KernelPath  string
 }
 
-func provisionWorkspace(opts provisionOptions) (*db.Workspace, error) {
-	if err := config.ValidateWorkspaceName(opts.Name); err != nil {
+// provisionWorkspace resolves an image, then uses the same publisher as fork.
+// The caller owns the workspace operation lock and command-scoped DB connection.
+func provisionWorkspace(database *sql.DB, opts provisionOptions) (*db.Workspace, error) {
+	if err := checkNewWorkspace(database, opts.Name); err != nil {
 		return nil, err
 	}
-	if opts.CPUs <= 0 || opts.CPUs > 255 {
-		return nil, fmt.Errorf("cpus must be between 1 and 255")
-	}
-	if opts.Memory <= 0 {
-		return nil, fmt.Errorf("memory must be greater than zero")
-	}
-	if err := validatePorts(opts.Ports); err != nil {
+	plan, err := resolvePlan(workspacePlan{
+		CPUs: opts.CPUs, Memory: opts.Memory, Ports: opts.Ports, Mount: opts.Mount,
+		Spec: workspace.Spec{UserCommand: opts.UserCommand, KernelPath: opts.KernelPath},
+	})
+	if err != nil {
 		return nil, err
 	}
 	if err := vm.CheckRuntime(); err != nil {
 		return nil, err
 	}
-	if err := storage.CheckDependencies(); err != nil {
-		return nil, err
-	}
-
-	mountHost, mountGuest, err := parseMount(opts.Mount)
-	if err != nil {
-		return nil, err
-	}
-	kernelPath, err := resolveKernelPath(opts.KernelPath)
-	if err != nil {
-		return nil, err
-	}
-
-	database, err := db.Open()
-	if err != nil {
-		return nil, fmt.Errorf("open database: %w", err)
-	}
-	defer database.Close()
-
-	exists, err := db.WorkspaceExists(database, opts.Name)
-	if err != nil {
-		return nil, fmt.Errorf("check workspace name: %w", err)
-	}
-	if exists {
-		return nil, fmt.Errorf("workspace %q already exists", opts.Name)
-	}
-
-	sshPort, err := nextAvailableSSHPort(database)
-	if err != nil {
-		return nil, fmt.Errorf("allocate ssh port: %w", err)
-	}
-	relayPort, err := db.NextRelayPort(database)
-	if err != nil {
-		return nil, fmt.Errorf("allocate relay port: %w", err)
-	}
-	if _, err := ssh.EnsureKeypair(); err != nil {
-		return nil, fmt.Errorf("ssh keypair: %w", err)
-	}
-
 	fmt.Printf("INFO Preparing image %q...\n", storage.QualifyImage(opts.Image))
 	prepareStart := time.Now()
 	template, err := storage.EnsureTemplate(opts.Image)
@@ -90,72 +53,122 @@ func provisionWorkspace(opts provisionOptions) (*db.Workspace, error) {
 	} else {
 		fmt.Printf("INFO Prepared ext4 template in %.2fs\n", time.Since(prepareStart).Seconds())
 	}
+	plan.Image = template.Manifest.Image
+	plan.ImageDigest = template.Manifest.Digest
+	plan.Spec.Environment = template.Manifest.Environment
+	plan.Spec.WorkingDir = template.Manifest.WorkingDir
+	return publishWorkspace(database, opts.Name, template.DiskPath, plan)
+}
 
-	wsDir, err := config.WorkspaceDir(opts.Name)
+func checkNewWorkspace(database *sql.DB, name string) error {
+	path, err := config.WorkspaceDir(name)
 	if err != nil {
-		return nil, fmt.Errorf("workspace dir: %w", err)
+		return err
 	}
-	diskPath, err := config.WorkspaceDiskPath(opts.Name)
+	exists, err := db.WorkspaceExists(database, name)
 	if err != nil {
-		return nil, fmt.Errorf("workspace disk path: %w", err)
+		return fmt.Errorf("check workspace name: %w", err)
 	}
-	createdRecord := false
-	success := false
+	if exists {
+		return fmt.Errorf("workspace %q already exists", name)
+	}
+	if _, err := os.Lstat(path); err == nil {
+		return fmt.Errorf("workspace directory %s already exists without a record; preserve or remove it explicitly before reusing the name", path)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("check workspace directory: %w", err)
+	}
+	return nil
+}
+
+// publishWorkspace owns staging until publication and never removes a directory
+// it did not create. Disk cloning is outside the short metadata critical section.
+// The caller holds the destination operation lock and, for fork, the source's
+// operation and disk locks. A crash may leave recoverable orphan files, never a
+// partially populated workspace visible through SQLite.
+func publishWorkspace(database *sql.DB, name, sourceDisk string, plan workspacePlan) (*db.Workspace, error) {
+	if err := checkNewWorkspace(database, name); err != nil {
+		return nil, err
+	}
+	if _, err := imageEnvironment(plan.Spec.Environment); err != nil {
+		return nil, err
+	}
+	parent, err := config.WorkspacesDir()
+	if err != nil {
+		return nil, err
+	}
+	stage, err := os.MkdirTemp(parent, ".create-"+name+"-")
+	if err != nil {
+		return nil, fmt.Errorf("stage workspace: %w", err)
+	}
+	ownedDir := stage
+	published := false
 	defer func() {
-		if success {
-			return
+		if !published {
+			if err := os.RemoveAll(ownedDir); err != nil {
+				fmt.Printf("WARN clean up workspace staging %s: %v\n", ownedDir, err)
+			}
 		}
-		if createdRecord {
-			_ = db.DeleteWorkspace(database, opts.Name)
-		}
-		_ = os.RemoveAll(wsDir)
 	}()
-
 	cloneStart := time.Now()
-	if err := storage.CloneDisk(template.DiskPath, diskPath); err != nil {
+	if err := storage.CloneDisk(sourceDisk, filepath.Join(stage, "rootfs.ext4")); err != nil {
 		return nil, err
 	}
-	fmt.Printf("INFO Cloned workspace disk in %s\n", time.Since(cloneStart).Round(time.Millisecond))
-
-	workspaceSpec := workspace.Spec{
-		Image:       template.Manifest.Image,
-		ImageDigest: template.Manifest.Digest,
-		Environment: template.Manifest.Environment,
-		WorkingDir:  template.Manifest.WorkingDir,
-		UserCommand: opts.UserCommand,
-		MountHost:   mountHost,
-		MountGuest:  mountGuest,
-		KernelPath:  kernelPath,
-	}
-	if err := workspace.Save(wsDir, workspaceSpec); err != nil {
+	if err := workspace.Save(stage, plan.Spec); err != nil {
 		return nil, err
 	}
+	if plan.ParentName != "" {
+		if err := workspace.MarkRegenerateIdentity(stage); err != nil {
+			return nil, err
+		}
+	}
 
+	unlock, err := db.LockMetadata()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	if _, err := ssh.EnsureKeypair(); err != nil {
+		return nil, err
+	}
+	sshPort, err := nextAvailableSSHPort(database)
+	if err != nil {
+		return nil, err
+	}
+	relayPort, err := db.NextRelayPort(database)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkNewWorkspace(database, name); err != nil {
+		return nil, err
+	}
+	destination := filepath.Join(parent, name)
+	if err := os.Rename(stage, destination); err != nil {
+		return nil, fmt.Errorf("publish workspace files: %w", err)
+	}
+	ownedDir = destination
+	parentDir, err := os.Open(parent)
+	if err != nil {
+		return nil, err
+	}
+	err = parentDir.Sync()
+	_ = parentDir.Close()
+	if err != nil {
+		return nil, fmt.Errorf("sync workspace publication: %w", err)
+	}
 	ws := &db.Workspace{
-		Name:         opts.Name,
-		Image:        template.Manifest.Image,
-		ImageDigest:  template.Manifest.Digest,
-		WorkspaceDir: wsDir,
-		DiskPath:     diskPath,
-		SSHPort:      sshPort,
-		RelayPort:    relayPort,
-		CPUs:         opts.CPUs,
-		Memory:       opts.Memory,
-		State:        "stopped",
+		Name: name, Image: plan.Image, ImageDigest: plan.ImageDigest,
+		ParentName: plan.ParentName, WorkspaceDir: destination,
+		DiskPath: filepath.Join(destination, "rootfs.ext4"),
+		SSHPort:  sshPort, RelayPort: relayPort, CPUs: plan.CPUs, Memory: plan.Memory,
+		State: "stopped",
 	}
-	if err := db.CreateWorkspace(database, ws); err != nil {
+	if err := db.CreateWorkspace(database, ws, plan.Ports...); err != nil {
 		return nil, fmt.Errorf("record workspace: %w", err)
 	}
-	createdRecord = true
-	for _, port := range opts.Ports {
-		if err := db.AddReservedPort(database, opts.Name, port); err != nil {
-			return nil, fmt.Errorf("reserve port %d: %w", port, err)
-		}
-	}
+	published = true
 	if err := updateSSHConfig(database); err != nil {
 		fmt.Printf("WARN update ssh config: %v\n", err)
 	}
-
-	success = true
+	fmt.Printf("INFO Cloned workspace disk in %s\n", time.Since(cloneStart).Round(time.Millisecond))
 	return ws, nil
 }

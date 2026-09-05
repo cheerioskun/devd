@@ -6,7 +6,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"devd/internal/db"
-	"devd/internal/vm"
+	"devd/internal/workspace"
 )
 
 var stopCmd = &cobra.Command{
@@ -19,6 +19,11 @@ var stopCmd = &cobra.Command{
 
 func runStop(cmd *cobra.Command, args []string) error {
 	name := args[0]
+	unlock, err := workspace.Lock(name)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 
 	database, err := db.Open()
 	if err != nil {
@@ -26,30 +31,22 @@ func runStop(cmd *cobra.Command, args []string) error {
 	}
 	defer database.Close()
 
-	ws, err := db.GetWorkspace(database, name)
+	ws, err := loadWorkspace(database, name)
 	if err != nil {
 		return err
 	}
 
-	if ws.State != "running" || !vm.IsRunning(ws.PID) {
-		if ws.State == "running" {
-			if err := db.SetWorkspaceState(database, name, "stopped", 0); err != nil {
-				return fmt.Errorf("reconcile workspace state: %w", err)
-			}
-		}
+	if ws.State != "running" {
 		fmt.Printf("INFO Workspace %q is already stopped\n", name)
 		return nil
 	}
 
 	fmt.Printf("INFO Stopping workspace %q (PID %d)...\n", name, ws.PID)
 
-	if err := stopWorkspace(ws); err != nil {
+	if err := stopWorkspace(database, ws); err != nil {
 		return fmt.Errorf("stop VM: %w", err)
 	}
 
-	if err := db.SetWorkspaceState(database, name, "stopped", 0); err != nil {
-		return fmt.Errorf("update state: %w", err)
-	}
 	fmt.Printf("INFO Workspace %q stopped\n", name)
 	return nil
 }

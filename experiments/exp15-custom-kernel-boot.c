@@ -4,6 +4,8 @@
  * Not production code.
  */
 #include <errno.h>
+#include <fcntl.h>
+#include <sys/file.h>
 #include <inttypes.h>
 #include <libkrun.h>
 #include <stdint.h>
@@ -61,14 +63,14 @@ static int launch(int argc, char **argv)
 {
     if (argc < 5 || argc > 8) {
         fprintf(stderr,
-                "usage: %s <disk> <devd-dir> <name> <ssh-port>"
+                "usage: %s <disk> <control-dir> <name> <ssh-port>"
                 " [kernel|- [initramfs|- [cmdline|-]]]\n",
                 argv[0]);
         return 2;
     }
 
     const char *disk = argv[1];
-    const char *devd_dir = argv[2];
+    const char *control_dir = argv[2];
     const char *name = argv[3];
     const char *port = argv[4];
     const char *kernel = argc > 5 && strcmp(argv[5], "-") != 0 ? argv[5] : NULL;
@@ -93,6 +95,12 @@ static int launch(int argc, char **argv)
         NULL,
     };
 
+    int disk_lock = open(disk, O_RDONLY | O_CLOEXEC);
+    if (disk_lock < 0 || flock(disk_lock, LOCK_EX | LOCK_NB) < 0) {
+        perror("exp15: lock root disk");
+        return 1;
+    }
+
     int32_t created = krun_create_ctx();
     if (created < 0) {
         check(created, "krun_create_ctx");
@@ -106,7 +114,7 @@ static int launch(int argc, char **argv)
               "krun_add_disk3") ||
         check(krun_set_root_disk_remount(ctx, "/dev/vda", "ext4", NULL),
               "krun_set_root_disk_remount") ||
-        check(krun_add_virtiofs(ctx, "devd", devd_dir),
+        check(krun_add_virtiofs(ctx, "devd", control_dir),
               "krun_add_virtiofs") ||
         check(krun_set_workdir(ctx, "/"), "krun_set_workdir"))
         return 1;
@@ -117,7 +125,12 @@ static int launch(int argc, char **argv)
               "krun_set_kernel"))
         return 1;
 
-    if (check(krun_set_exec(ctx, "/usr/local/sbin/devd-init", NULL, envp),
+    const char *boot_args[] = {
+        "-c",
+        "mkdir -p /devd && mount -t virtiofs devd /devd && exec /bin/sh /devd/devd-init",
+        NULL,
+    };
+    if (check(krun_set_exec(ctx, "/bin/sh", boot_args, envp),
               "krun_set_exec"))
         return 1;
 

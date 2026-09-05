@@ -88,6 +88,13 @@ if [[ -n ${DEVD_TEST_IMAGE_CACHE:-} ]]; then
     ln -s "$DEVD_TEST_IMAGE_CACHE" "$STATE/images"
 fi
 
+step "Reject invalid companion arguments before VM entry"
+if invalid_output=$("$ROOT/bin/devd-vm" --disk /nonexistent --cpus 256 -- /bin/true 2>&1); then
+    fail "companion accepted a CPU count that overflows uint8"
+fi
+[[ "$invalid_output" == *"invalid numeric option"* ]] || fail "companion failed for the wrong reason: $invalid_output"
+printf 'PASS companion numeric validation\n'
+
 step "Run a workspace with the default project mount"
 printf 'from-host\n' >"$PROJECT/host.txt"
 run_output=$(cd "$PROJECT" && "$DEVD" run "$IMAGE" -n source)
@@ -97,14 +104,39 @@ assert_eq "from-host" "$(remote source 'cat /workspace/host.txt')" "host file vi
 remote source 'printf "from-guest\n" >/workspace/guest.txt'
 assert_eq "from-guest" "$(tr -d '\n' <"$PROJECT/guest.txt")" "guest write visible on host"
 
+step "Guest control export excludes host management state"
+remote source 'test -f /devd/authorized_keys && test -f /devd/devd-init && test ! -e /devd/ssh && test ! -e /devd/workspaces && test ! -e /devd/config.json && test ! -e /devd/rootfs.ext4 && test ! -e /devd/devd.db'
+remote source 'sshd -T -f /tmp/sshd_config | grep -q "^passwordauthentication no$"'
+printf 'PASS scoped control export and key-only SSH\n'
+python3 - "$STATE/workspaces/source/rootfs.ext4" <<'PY'
+import fcntl, sys
+with open(sys.argv[1], 'rb') as disk:
+    try:
+        fcntl.flock(disk, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print('PASS companion holds root-disk lifetime lock')
+    else:
+        raise SystemExit('FAIL live companion did not lock its disk')
+PY
+
 step "Persist guest disk state across stop/start"
 remote source 'printf "persistent\n" >/root/persistent-marker'
 source_machine=$(remote source 'cat /etc/machine-id')
 source_host_key=$(remote source 'cat /etc/ssh/ssh_host_ed25519_key.pub')
+# An obsolete or modified in-disk bootstrap must not own current guest policy.
+remote source 'mkdir -p /usr/local/sbin && printf "#!/bin/sh\nexit 42\n" >/usr/local/sbin/devd-init'
 "$DEVD" stop source
 [[ $("$DEVD" ps -a) == *"source"*"stopped"* ]] || fail "ps -a did not show stopped source"
-"$DEVD" start source
-assert_eq "persistent" "$(remote source 'cat /root/persistent-marker')" "disk state after restart"
+"$DEVD" start source >"$STATE/start-a.log" 2>&1 &
+start_a=$!
+"$DEVD" start source >"$STATE/start-b.log" 2>&1 &
+start_b=$!
+status_a=0; wait "$start_a" || status_a=$?
+status_b=0; wait "$start_b" || status_b=$?
+[[ ( $status_a == 0 && $status_b != 0 ) || ( $status_b == 0 && $status_a != 0 ) ]] || \
+    fail "concurrent starts should have exactly one winner (got $status_a, $status_b)"
+printf 'PASS concurrent starts have one owner\n'
+assert_eq "persistent" "$(remote source 'cat /root/persistent-marker')" "disk state after restart with current host bootstrap"
 
 step "Fork complete stopped state with fresh identity"
 "$DEVD" stop source

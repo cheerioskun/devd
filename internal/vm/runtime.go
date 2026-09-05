@@ -2,6 +2,7 @@ package vm
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -68,39 +69,30 @@ func companionPath(envName, name string) (string, error) {
 
 // StartOpts configures one ext4-root workspace VM.
 type StartOpts struct {
-	DiskPath   string
-	CPUs       int
-	Memory     int
-	Env        []string
-	Mounts     []Mount
-	Command    string
-	Args       []string
-	Workdir    string
-	LogFile    string
-	KernelPath string
+	DiskPath    string
+	CPUs        int
+	Memory      int
+	Env         []string
+	Mounts      []Mount
+	Command     string
+	Args        []string
+	Workdir     string
+	LogFile     string
+	KernelPath  string
+	ProcessFile string
 }
 
-// Start launches an ext4-root VM in the background and returns its VMM PID.
-func Start(opts StartOpts) (int, error) {
+// Start launches a detached VM and records its process identity before returning.
+// The companion also locks its root disk for its entire lifetime.
+func Start(opts StartOpts) (Process, error) {
 	runtimePath, err := RuntimePath()
 	if err != nil {
-		return 0, err
+		return Process{}, err
 	}
-	if opts.DiskPath == "" {
-		return 0, fmt.Errorf("root disk path is required")
+	args, err := startArgs(opts)
+	if err != nil {
+		return Process{}, err
 	}
-	if opts.Command == "" {
-		return 0, fmt.Errorf("guest command is required")
-	}
-
-	args := []string{"--disk", opts.DiskPath}
-	if opts.KernelPath != "" {
-		args = append(args, "--kernel", opts.KernelPath)
-	}
-	args = appendVMConfig(args, opts.CPUs, opts.Memory, opts.Env, opts.Mounts, opts.Workdir)
-	args = append(args, "--", opts.Command)
-	args = append(args, opts.Args...)
-
 	cmd := exec.Command(runtimePath, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
@@ -108,7 +100,7 @@ func Start(opts StartOpts) (int, error) {
 	if opts.LogFile != "" {
 		file, openErr := os.OpenFile(opts.LogFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 		if openErr != nil {
-			return 0, fmt.Errorf("open VM log: %w", openErr)
+			return Process{}, fmt.Errorf("open VM log: %w", openErr)
 		}
 		logFile = file
 		cmd.Stdout = file
@@ -119,13 +111,46 @@ func Start(opts StartOpts) (int, error) {
 		if logFile != nil {
 			_ = logFile.Close()
 		}
-		return 0, fmt.Errorf("start devd-vm: %w", err)
+		return Process{}, fmt.Errorf("start devd-vm: %w", err)
 	}
 	if logFile != nil {
 		_ = logFile.Close()
 	}
 	go cmd.Wait() // reap the detached VMM when the guest exits
-	return cmd.Process.Pid, nil
+	identity, err := processIdentity(cmd.Process.Pid)
+	process := Process{PID: cmd.Process.Pid, StartTime: identity}
+	if err == nil && identity == "" {
+		err = fmt.Errorf("VM exited before its process identity could be recorded")
+	}
+	if err == nil {
+		err = writeProcess(opts.ProcessFile, process)
+	}
+	if err != nil {
+		// We still own the launched process. Never return a launch success without
+		// its recovery receipt. The companion's disk lock protects the failure gap.
+		_ = cmd.Process.Kill()
+		return Process{}, fmt.Errorf("record VM process (PID %d): %w", process.PID, err)
+	}
+	return process, nil
+}
+
+func startArgs(opts StartOpts) ([]string, error) {
+	if opts.DiskPath == "" || opts.Command == "" || opts.ProcessFile == "" {
+		return nil, fmt.Errorf("root disk, guest command, and process receipt path are required")
+	}
+	if opts.CPUs < 1 || opts.CPUs > 255 || opts.Memory < 1 || uint64(opts.Memory) > uint64(^uint32(0)) {
+		return nil, fmt.Errorf("invalid VM CPU or memory allocation")
+	}
+	if len(opts.Env) > 64 || len(opts.Mounts) > 8 {
+		return nil, fmt.Errorf("VM configuration exceeds companion limits (64 environment entries, 8 mounts)")
+	}
+	args := []string{"--disk", opts.DiskPath}
+	if opts.KernelPath != "" {
+		args = append(args, "--kernel", opts.KernelPath)
+	}
+	args = appendVMConfig(args, opts.CPUs, opts.Memory, opts.Env, opts.Mounts, opts.Workdir)
+	args = append(args, "--", opts.Command)
+	return append(args, opts.Args...), nil
 }
 
 // PackOpts configures the one-time OCI directory to ext4 conversion helper.
@@ -197,7 +222,7 @@ func appendVMConfig(args []string, cpus, memory int, env []string, mounts []Moun
 // StopOpts configures graceful guest shutdown with a bounded VMM signal
 // fallback for guests that never reached SSH.
 type StopOpts struct {
-	PID      int
+	Process  Process
 	SSHPort  int
 	KeyPath  string
 	Graceful time.Duration
@@ -206,15 +231,16 @@ type StopOpts struct {
 // Stop asks the main guest workload to exit, allowing init.krun to unmount the
 // ext4 root. SIGTERM and SIGKILL are bounded crash-recovery fallbacks.
 func Stop(opts StopOpts) error {
-	if opts.PID <= 0 {
-		return nil
+	running, err := opts.Process.Running()
+	if err != nil || !running {
+		return err
 	}
 	graceful := opts.Graceful
 	if graceful == 0 {
 		graceful = 5 * time.Second
 	}
 
-	if opts.SSHPort > 0 && opts.KeyPath != "" && IsRunning(opts.PID) {
+	if opts.SSHPort > 0 && opts.KeyPath != "" {
 		sshArgs := []string{
 			"-o", "BatchMode=yes",
 			"-o", "StrictHostKeyChecking=no",
@@ -226,57 +252,60 @@ func Stop(opts StopOpts) error {
 			"root@127.0.0.1",
 			`sync; kill -TERM "$(cat /run/devd-workload.pid)"`,
 		}
-		cmd := exec.Command("ssh", sshArgs...)
+		ctx, cancel := context.WithTimeout(context.Background(), graceful)
+		cmd := exec.CommandContext(ctx, "ssh", sshArgs...)
 		cmd.Stdin = nil
 		cmd.Stdout = io.Discard
 		cmd.Stderr = io.Discard
 		_ = cmd.Run() // disconnect during shutdown commonly returns 255
-		if waitForExit(opts.PID, graceful) {
-			return nil
+		cancel()
+		if exited, err := waitForExit(opts.Process, graceful); err != nil || exited {
+			return err
 		}
 	}
 
-	proc, err := os.FindProcess(opts.PID)
-	if err != nil {
-		return nil
-	}
-	if err := proc.Signal(syscall.SIGTERM); err != nil {
-		if errors.Is(err, os.ErrProcessDone) {
-			return nil
+	for _, signal := range []syscall.Signal{syscall.SIGTERM, syscall.SIGKILL} {
+		// Recheck the incarnation before each destructive action, including the
+		// escalation after a timeout. A recycled PID is not our VM.
+		running, err := opts.Process.Running()
+		if err != nil || !running {
+			return err
 		}
-		return fmt.Errorf("signal PID %d: %w", opts.PID, err)
+		proc, err := os.FindProcess(opts.Process.PID)
+		if err != nil {
+			return err
+		}
+		if err := proc.Signal(signal); err != nil && !errors.Is(err, os.ErrProcessDone) && !errors.Is(err, syscall.ESRCH) {
+			return fmt.Errorf("signal PID %d: %w", opts.Process.PID, err)
+		}
+		if exited, err := waitForExit(opts.Process, 5*time.Second); err != nil || exited {
+			return err
+		}
 	}
-	if waitForExit(opts.PID, 5*time.Second) {
-		return nil
-	}
-	if err := proc.Signal(syscall.SIGKILL); err != nil && !errors.Is(err, os.ErrProcessDone) {
-		return fmt.Errorf("kill PID %d after timeout: %w", opts.PID, err)
-	}
-	if !waitForExit(opts.PID, 5*time.Second) {
-		return fmt.Errorf("PID %d did not exit after SIGKILL", opts.PID)
-	}
-	return nil
+	return fmt.Errorf("PID %d did not exit after SIGKILL", opts.Process.PID)
 }
 
-func waitForExit(pid int, timeout time.Duration) bool {
+func waitForExit(process Process, timeout time.Duration) (bool, error) {
 	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if !IsRunning(pid) {
-			return true
+	for {
+		running, err := process.Running()
+		if err != nil || !running {
+			return !running, err
+		}
+		if !time.Now().Before(deadline) {
+			return false, nil
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	return !IsRunning(pid)
 }
 
-// IsRunning checks whether a VMM process is alive.
+// IsRunning is a conservative legacy-PID probe, not proof of VM identity.
+// Observation errors count as alive so migration cannot authorize disk reuse
+// on missing permissions. New launches must use Process.Running instead.
 func IsRunning(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	return proc.Signal(syscall.Signal(0)) == nil
+	identity, err := processIdentity(pid)
+	return err != nil || identity != ""
 }

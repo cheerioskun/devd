@@ -85,12 +85,13 @@ func runDaemon(cmd *cobra.Command, args []string) error {
 		log.Printf("PROXY: initial port reconciliation: %v", ensureErr)
 	}
 
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(signals)
 	go serveDaemonControl(listener, portProxy)
 	go reconcileDaemonPorts(database, portProxy)
 	log.Printf("PROXY: daemon ready (socket %s)", socketPath)
 
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 	received := <-signals
 	log.Printf("PROXY: received %v, shutting down", received)
 	return nil
@@ -137,12 +138,19 @@ func reconcileDaemonPorts(database *sql.DB, portProxy *proxy.Proxy) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
-		ports, err := db.GetAllReservedPorts(database)
+		// Snapshot and application are one metadata critical section. Otherwise
+		// an old snapshot could release a newly pre-empted port just before boot.
+		unlock, err := db.LockMetadata()
 		if err != nil {
-			log.Printf("PROXY: read reserved ports: %v", err)
+			log.Printf("PROXY: lock port reconciliation: %v", err)
 			continue
 		}
-		if err := portProxy.ReconcilePorts(ports); err != nil {
+		ports, err := db.GetAllReservedPorts(database)
+		if err == nil {
+			err = portProxy.ReconcilePorts(ports)
+		}
+		unlock()
+		if err != nil {
 			log.Printf("PROXY: reconcile ports: %v", err)
 		}
 	}
@@ -180,8 +188,31 @@ func requestProxyDaemon(ports []int) (bool, error) {
 	return sendProxyDaemonRequest(daemonRequest{Command: "ensure", Ports: ports})
 }
 
-func shutdownProxyDaemon() {
-	_, _ = sendProxyDaemonRequest(daemonRequest{Command: "shutdown"})
+// shutdownProxyDaemon is called under the metadata lock after deleting the last
+// declaration. Wait for socket removal before allowing a new workspace to be
+// published, so it cannot successfully ensure ports on a daemon that is exiting.
+func shutdownProxyDaemon() error {
+	connected, err := sendProxyDaemonRequest(daemonRequest{Command: "shutdown"})
+	if !connected {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	path, err := config.DaemonSocketPath()
+	if err != nil {
+		return err
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			return nil
+		} else if err != nil {
+			return err
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return fmt.Errorf("proxy daemon did not remove its control socket after shutdown")
 }
 
 func sendProxyDaemonRequest(request daemonRequest) (bool, error) {

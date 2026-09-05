@@ -121,7 +121,7 @@ launch_vm() {
     local initramfs=$6
     local cmdline=$7
 
-    "$WORK_DIR/launcher" "$disk" "$DEVD_DIR" "$name" "$port" \
+    "$WORK_DIR/launcher" "$disk" "$DEVD_DIR/workspaces/$name/control" "$name" "$port" \
         "$kernel" "$initramfs" "$cmdline" >"$WORK_DIR/$label.log" 2>&1 &
     LAUNCH_PID=$!
     PIDS+=("$LAUNCH_PID")
@@ -218,9 +218,9 @@ printf '%-24s kernel=%s\n' kernel-b-child "$child_uname"
 [ "$source_uname" != "$child_uname" ] || fail "independent kernels reported the same release"
 [ "$(ssh_guest "$source_port" cat /root/exp15-inherited)" = inherited-before-fork ] || fail "source lost inherited marker"
 [ "$(ssh_guest "$child_port" cat /root/exp15-inherited)" = inherited-before-fork ] || fail "child lost inherited marker"
-ssh_guest "$source_port" 'test ! -e /root/exp15-child-only; printf source-only > /root/exp15-source-only' || \
+ssh_guest "$source_port" 'test ! -e /root/exp15-child-only && printf source-only > /root/exp15-source-only' || \
     fail "child-only write leaked into source"
-ssh_guest "$child_port" 'test ! -e /root/exp15-source-only; test "$(cat /root/exp15-child-only)" = child-only' || \
+ssh_guest "$child_port" 'test ! -e /root/exp15-source-only && test "$(cat /root/exp15-child-only)" = child-only' || \
     fail "source write leaked into child or child write was lost"
 # Both commands succeeding while both launcher PIDs are alive proves concurrent
 # guest operation rather than sequential reuse of one root disk.

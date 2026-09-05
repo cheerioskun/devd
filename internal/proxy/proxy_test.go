@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"os"
 	"strings"
 	"testing"
 
@@ -14,6 +15,7 @@ func TestTunnelPathStaysBelowUnixSocketLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = os.Remove(path) })
 	if len(path) >= 104 {
 		t.Fatalf("tunnel path is too long for macOS Unix sockets: %d bytes: %s", len(path), path)
 	}

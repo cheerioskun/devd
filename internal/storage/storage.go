@@ -263,9 +263,6 @@ func prepareHelperRoot(dir string) error {
 	if err := copyFile(helper, filepath.Join(dir, "devd-image-helper"), 0755); err != nil {
 		return fmt.Errorf("install image helper: %w", err)
 	}
-	if _, err := vm.WriteGuestInit(dir); err != nil {
-		return err
-	}
 	return nil
 }
 

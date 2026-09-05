@@ -1,217 +1,223 @@
 package cli
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
 
 	"devd/internal/config"
 	"devd/internal/db"
 	"devd/internal/ssh"
+	"devd/internal/storage"
 	"devd/internal/vm"
 	"devd/internal/workspace"
 )
 
-func resolveKernelPath(value string) (string, error) {
-	if value == "" {
-		return "", nil
-	}
-	path, err := filepath.Abs(value)
-	if err != nil {
-		return "", fmt.Errorf("resolve kernel path: %w", err)
-	}
-	path, err = filepath.EvalSymlinks(path)
-	if err != nil {
-		return "", fmt.Errorf("resolve kernel path %q: %w", value, err)
-	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return "", fmt.Errorf("inspect kernel path: %w", err)
-	}
-	if !info.Mode().IsRegular() {
-		return "", fmt.Errorf("kernel path %q is not a regular file", value)
-	}
-	return path, nil
+func processPath(ws *db.Workspace) string {
+	return filepath.Join(ws.WorkspaceDir, "process.json")
 }
 
-func validatePorts(ports []int) error {
-	seen := make(map[int]bool, len(ports))
-	for _, port := range ports {
-		if port < 1 || port > 65535 {
-			return fmt.Errorf("port %d must be between 1 and 65535", port)
+// loadWorkspace observes the launch receipt rather than trusting a cached DB
+// state or reusable PID. The caller holds the workspace operation lock.
+func loadWorkspace(database *sql.DB, name string) (*db.Workspace, error) {
+	ws, err := db.GetWorkspace(database, name)
+	if err != nil {
+		return nil, err
+	}
+	process, err := vm.ReadProcess(processPath(ws))
+	if err != nil {
+		return nil, err
+	}
+	state, pid := "stopped", 0
+	if process != nil {
+		running, err := process.Running()
+		if err != nil {
+			return nil, err
 		}
-		if seen[port] {
-			return fmt.Errorf("port %d was declared more than once", port)
+		if running {
+			state, pid = "running", process.PID
 		}
-		seen[port] = true
+	} else if vm.IsRunning(ws.PID) {
+		// Older companions have neither identity receipts nor root-disk locks.
+		// Never guess that their PID is safe to signal or their disk safe to use.
+		return nil, fmt.Errorf("workspace %q has an unverified legacy PID %d; stop it with the previous devd version before upgrading", name, ws.PID)
 	}
-	return nil
+	if state == "stopped" && ws.DiskPath != "" {
+		lock, err := storage.LockDisk(ws.DiskPath)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("cannot confirm workspace %q is stopped: %w", name, err)
+		}
+		if lock != nil {
+			_ = lock.Close()
+		}
+	}
+	if ws.State != state || ws.PID != pid || (state == "stopped" && ws.IsActive) {
+		if err := db.SetWorkspaceState(database, name, state, pid); err != nil {
+			return nil, fmt.Errorf("reconcile workspace state: %w", err)
+		}
+	}
+	ws.State, ws.PID = state, pid
+	if state == "stopped" {
+		ws.IsActive = false
+	}
+	return ws, nil
 }
 
-func parseMount(value string) (string, string, error) {
-	if value == "" {
-		return "", "", nil
-	}
-	parts := strings.SplitN(value, ":", 2)
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return "", "", fmt.Errorf("--mount must be host:guest (e.g. .:/workspace)")
-	}
-	host, err := filepath.Abs(parts[0])
-	if err != nil {
-		return "", "", fmt.Errorf("resolve mount host path: %w", err)
-	}
-	host, err = filepath.EvalSymlinks(host)
-	if err != nil {
-		return "", "", fmt.Errorf("resolve mount host path %q: %w", parts[0], err)
-	}
-	info, err := os.Stat(host)
-	if err != nil {
-		return "", "", fmt.Errorf("inspect mount host path: %w", err)
-	}
-	if !info.IsDir() {
-		return "", "", fmt.Errorf("mount host path %q is not a directory", host)
-	}
-
-	guest := filepath.Clean(parts[1])
-	if !filepath.IsAbs(guest) || guest != parts[1] || strings.ContainsAny(guest, "\r\n") {
-		return "", "", fmt.Errorf("mount guest path %q must be a clean absolute path", parts[1])
-	}
-	switch guest {
-	case "/", "/dev", "/proc", "/sys", "/run", "/devd":
-		return "", "", fmt.Errorf("mount guest path %q is reserved", guest)
-	}
-	return host, guest, nil
-}
-
+// startWorkspace requires the operation lock. A started process is recorded
+// before readiness; only a ready workspace becomes the active routing target.
 func startWorkspace(database *sql.DB, ws *db.Workspace) (time.Duration, error) {
+	if ws.State == "running" {
+		return 0, fmt.Errorf("workspace %q is already running (PID %d)", ws.Name, ws.PID)
+	}
 	if ws.DiskPath == "" {
 		return 0, fmt.Errorf("workspace %q has no ext4 disk path", ws.Name)
 	}
-	if info, err := os.Stat(ws.DiskPath); err != nil || !info.Mode().IsRegular() {
-		if err == nil {
-			err = fmt.Errorf("not a regular file")
-		}
-		return 0, fmt.Errorf("workspace disk %s: %w", ws.DiskPath, err)
-	}
-	workspaceSpec, err := workspace.Load(ws.WorkspaceDir)
+	diskLock, err := storage.LockDisk(ws.DiskPath)
 	if err != nil {
 		return 0, err
 	}
-	devdDir, err := config.DevdDir()
+	defer func() { _ = diskLock.Close() }()
+	boot, err := prepareBoot(ws)
 	if err != nil {
-		return 0, fmt.Errorf("devd directory: %w", err)
+		return 0, err
 	}
-
-	mounts := []vm.Mount{{Tag: "devd", HostPath: devdDir}}
-	if workspaceSpec.MountHost != "" {
-		mounts = append(mounts, vm.Mount{Tag: "workspace", HostPath: workspaceSpec.MountHost})
-	}
-	environment := imageEnvironment(workspaceSpec.Environment)
-	environment = append(environment,
-		"HOME=/root",
-		"DEVD_NAME="+ws.Name,
-		"DEVD_SSH_PORT="+strconv.Itoa(ws.SSHPort),
-	)
-	logFile := filepath.Join(ws.WorkspaceDir, "vm.log")
-
+	logFile := boot.LogFile
 	reservedPorts, err := db.GetReservedPorts(database, ws.Name)
 	if err != nil {
 		return 0, fmt.Errorf("read declared ports: %w", err)
 	}
 	if err := ensureProxyDaemon(reservedPorts); err != nil {
-		return 0, fmt.Errorf("start workspace %q: %w", ws.Name, err)
+		return 0, fmt.Errorf("prepare workspace ports: %w", err)
 	}
-
+	if err := ensurePortAvailable(ws.SSHPort); err != nil {
+		return 0, err
+	}
 	fmt.Printf("INFO Starting workspace %q...\n", ws.Name)
 	bootStart := time.Now()
-	if err := ensurePortAvailable(ws.SSHPort); err != nil {
-		return 0, fmt.Errorf("start workspace %q: %w", ws.Name, err)
+	// Hand off the inode lock to the companion. The operation lock still
+	// excludes all other devd commands; a competing direct launcher fails safe.
+	if err := diskLock.Close(); err != nil {
+		return 0, err
 	}
-	pid, err := vm.Start(vm.StartOpts{
-		DiskPath:   ws.DiskPath,
-		CPUs:       ws.CPUs,
-		Memory:     ws.Memory,
-		Env:        environment,
-		Mounts:     mounts,
-		Command:    "/usr/local/sbin/devd-init",
-		Workdir:    "/",
-		LogFile:    logFile,
-		KernelPath: workspaceSpec.KernelPath,
-	})
+	process, err := vm.Start(boot)
 	if err != nil {
 		return 0, fmt.Errorf("start VM: %w", err)
 	}
-
-	stopAfterFailure := func() {
-		keyPath, _ := config.PrivateKeyPath()
-		if stopErr := vm.Stop(vm.StopOpts{PID: pid, SSHPort: ws.SSHPort, KeyPath: keyPath}); stopErr != nil {
-			fmt.Printf("WARN stop VM after startup failure: %v\n", stopErr)
-		}
+	ws.PID, ws.State = process.PID, "running"
+	fail := func(cause error) (time.Duration, error) {
+		// A failed stop must retain the running state and process receipt.
+		stopErr := stopWorkspace(database, ws)
+		return 0, fmt.Errorf("workspace %q failed to start (log: %s): %w", ws.Name, logFile, errors.Join(cause, stopErr))
 	}
-	if err := db.SetWorkspaceState(database, ws.Name, "running", pid); err != nil {
-		stopAfterFailure()
-		return 0, fmt.Errorf("update state: %w", err)
+	if err := db.SetWorkspaceState(database, ws.Name, "running", process.PID); err != nil {
+		return fail(fmt.Errorf("record running state: %w", err))
+	}
+	fmt.Printf("INFO Waiting for SSH on port %d...\n", ws.SSHPort)
+	if err := waitForSSH(ws.SSHPort, process, 30*time.Second); err != nil {
+		// Preserve the current custom-kernel diagnostic contract. Explicit
+		// asynchronous startup will replace this exception in a separate change.
+		if running, observeErr := process.Running(); boot.KernelPath != "" && observeErr == nil && running {
+			return 0, fmt.Errorf("workspace %q did not reach SSH: %w (VM left running; log: %s; stop with: devd stop %s)", ws.Name, err, logFile, ws.Name)
+		}
+		return fail(err)
+	}
+	if err := workspace.CompleteBoot(ws.WorkspaceDir); err != nil {
+		return fail(err)
 	}
 	if err := db.SetActiveWorkspace(database, ws.Name); err != nil {
-		stopAfterFailure()
-		if stateErr := db.SetWorkspaceState(database, ws.Name, "stopped", 0); stateErr != nil {
-			fmt.Printf("WARN update state after active-workspace failure: %v\n", stateErr)
-		}
-		return 0, fmt.Errorf("set active: %w", err)
+		return fail(fmt.Errorf("activate workspace: %w", err))
 	}
-
-	fmt.Printf("INFO Waiting for SSH on port %d...\n", ws.SSHPort)
-	if err := waitForSSH(ws.SSHPort, pid, 30*time.Second); err != nil {
-		if workspaceSpec.KernelPath != "" && vm.IsRunning(pid) {
-			return 0, fmt.Errorf("workspace %q did not reach SSH with custom kernel: %w (VM left running; check log: %s; stop with: devd stop %s)", ws.Name, err, logFile, ws.Name)
-		}
-		stopAfterFailure()
-		if stateErr := db.SetWorkspaceState(database, ws.Name, "stopped", 0); stateErr != nil {
-			fmt.Printf("WARN update state after startup failure: %v\n", stateErr)
-		}
-		return 0, fmt.Errorf("workspace %q failed to start: %w (check log: %s)", ws.Name, err, logFile)
-	}
-	ws.PID = pid
-	ws.State = "running"
+	ws.IsActive = true
 	return time.Since(bootStart), nil
 }
 
-func imageEnvironment(values []string) []string {
-	result := make([]string, 0, len(values))
-	for _, value := range values {
-		if strings.HasPrefix(value, "HOME=") || strings.HasPrefix(value, "DEVD_NAME=") || strings.HasPrefix(value, "DEVD_SSH_PORT=") {
-			continue
-		}
-		if strings.ContainsRune(value, '\x00') || !strings.Contains(value, "=") {
-			continue
-		}
-		// Leave room under devd-vm's 64-entry limit for HOME and two instance values.
-		if len(result) == 61 {
-			break
-		}
-		result = append(result, value)
+// prepareBoot revalidates persisted inputs and renders the guest control export.
+// It does not launch a process, reserve ports, or change routing/runtime state.
+// The caller holds both the operation lock and the stopped disk's inode lock.
+func prepareBoot(ws *db.Workspace) (vm.StartOpts, error) {
+	spec, err := workspace.Load(ws.WorkspaceDir)
+	if err != nil {
+		return vm.StartOpts{}, err
 	}
-	return result
+	mount := ""
+	if spec.MountHost != "" {
+		mount = spec.MountHost + ":" + spec.MountGuest
+	}
+	plan, err := resolvePlan(workspacePlan{Spec: *spec, CPUs: ws.CPUs, Memory: ws.Memory, Mount: mount})
+	if err != nil {
+		return vm.StartOpts{}, err
+	}
+	environment, err := imageEnvironment(plan.Spec.Environment)
+	if err != nil {
+		return vm.StartOpts{}, err
+	}
+	publicKey, err := ssh.PublicKey()
+	if err != nil {
+		return vm.StartOpts{}, err
+	}
+	// Upgrading before launch prevents an older binary from silently resuming
+	// the obsolete global-export bootstrap contract on a later start.
+	if err := workspace.Save(ws.WorkspaceDir, plan.Spec); err != nil {
+		return vm.StartOpts{}, err
+	}
+	control, err := workspace.PrepareControl(ws.WorkspaceDir, plan.Spec, publicKey)
+	if err != nil {
+		return vm.StartOpts{}, err
+	}
+	if _, err := vm.WriteGuestInit(control); err != nil {
+		return vm.StartOpts{}, err
+	}
+	mounts := []vm.Mount{{Tag: "devd", HostPath: control}}
+	if plan.Spec.MountHost != "" {
+		mounts = append(mounts, vm.Mount{Tag: "workspace", HostPath: plan.Spec.MountHost})
+	}
+	environment = append(environment,
+		"HOME=/root", "DEVD_NAME="+ws.Name, "DEVD_SSH_PORT="+strconv.Itoa(ws.SSHPort))
+	return vm.StartOpts{
+		DiskPath: ws.DiskPath, CPUs: ws.CPUs, Memory: ws.Memory,
+		Env: environment, Mounts: mounts, Command: "/bin/sh",
+		Args: []string{"-c", vm.GuestBootstrap}, Workdir: "/",
+		LogFile:    filepath.Join(ws.WorkspaceDir, "vm.log"),
+		KernelPath: plan.Spec.KernelPath, ProcessFile: processPath(ws),
+	}, nil
 }
 
-func stopWorkspace(ws *db.Workspace) error {
-	keyPath, err := config.PrivateKeyPath()
+// stopWorkspace changes persistent state only after the exact launched process
+// has exited. Both stop and forced removal use this same contract.
+func stopWorkspace(database *sql.DB, ws *db.Workspace) error {
+	process, err := vm.ReadProcess(processPath(ws))
 	if err != nil {
 		return err
 	}
-	return vm.Stop(vm.StopOpts{
-		PID:     ws.PID,
-		SSHPort: ws.SSHPort,
-		KeyPath: keyPath,
-	})
+	if process == nil && vm.IsRunning(ws.PID) {
+		return fmt.Errorf("cannot stop unverified VM PID %d", ws.PID)
+	}
+	if process != nil {
+		keyPath, err := config.PrivateKeyPath()
+		if err != nil {
+			return err
+		}
+		if err := vm.Stop(vm.StopOpts{Process: *process, SSHPort: ws.SSHPort, KeyPath: keyPath}); err != nil {
+			return fmt.Errorf("stop VM: %w", err)
+		}
+	}
+	if err := db.SetWorkspaceState(database, ws.Name, "stopped", 0); err != nil {
+		return fmt.Errorf("record stopped state: %w", err)
+	}
+	ws.State, ws.PID, ws.IsActive = "stopped", 0, false
+	return nil
 }
 
+// nextAvailableSSHPort is called under the metadata lock, so allocation and
+// publication cannot race another devd command. External listeners are checked
+// again at launch; devd cannot reserve against unrelated host processes.
 func nextAvailableSSHPort(database *sql.DB) (int, error) {
 	port, err := db.NextSSHPort(database)
 	if err != nil {
@@ -227,40 +233,37 @@ func nextAvailableSSHPort(database *sql.DB) (int, error) {
 }
 
 func ensurePortAvailable(port int) error {
-	address := net.JoinHostPort("0.0.0.0", strconv.Itoa(port))
-	listener, err := net.Listen("tcp", address)
+	listener, err := net.Listen("tcp", net.JoinHostPort("0.0.0.0", strconv.Itoa(port)))
 	if err != nil {
 		return fmt.Errorf("SSH port %d is already in use: %w", port, err)
 	}
-	if err := listener.Close(); err != nil {
-		return fmt.Errorf("release SSH port %d after availability check: %w", port, err)
-	}
-	return nil
+	return listener.Close()
 }
 
-func waitForSSH(port, pid int, timeout time.Duration) error {
+func waitForSSH(port int, process vm.Process, timeout time.Duration) error {
 	keyPath, err := config.PrivateKeyPath()
 	if err != nil {
 		return err
 	}
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if !vm.IsRunning(pid) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	for ctx.Err() == nil {
+		running, err := process.Running()
+		if err != nil {
+			return err
+		}
+		if !running {
 			return fmt.Errorf("VM process exited before SSH became ready")
 		}
-		sshCheck := exec.Command("ssh",
-			"-o", "BatchMode=yes",
-			"-o", "StrictHostKeyChecking=no",
-			"-o", "UserKnownHostsFile=/dev/null",
-			"-o", "LogLevel=ERROR",
-			"-o", "ConnectTimeout=1",
-			"-o", "ConnectionAttempts=1",
-			"-i", keyPath,
-			"-p", strconv.Itoa(port),
-			"root@127.0.0.1",
-			"true",
-		)
-		if err := sshCheck.Run(); err == nil {
+		attempt, cancel := context.WithTimeout(ctx, time.Second)
+		check := exec.CommandContext(attempt, "ssh",
+			"-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+			"-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR",
+			"-o", "ConnectTimeout=1", "-o", "ConnectionAttempts=1",
+			"-i", keyPath, "-p", strconv.Itoa(port), "root@127.0.0.1", "true")
+		err = check.Run()
+		cancel()
+		if err == nil {
 			return nil
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -268,14 +271,15 @@ func waitForSSH(port, pid int, timeout time.Duration) error {
 	return fmt.Errorf("SSH not ready on port %d after %s", port, timeout)
 }
 
+// updateSSHConfig is a derived view refresh, serialized with metadata changes.
 func updateSSHConfig(database *sql.DB) error {
-	allWorkspaces, err := db.ListWorkspaces(database)
+	all, err := db.ListWorkspaces(database)
 	if err != nil {
 		return err
 	}
-	entries := make([]ssh.SSHConfigEntry, 0, len(allWorkspaces))
-	for _, workspace := range allWorkspaces {
-		entries = append(entries, ssh.SSHConfigEntry{Name: workspace.Name, Port: workspace.SSHPort})
+	entries := make([]ssh.SSHConfigEntry, 0, len(all))
+	for _, ws := range all {
+		entries = append(entries, ssh.SSHConfigEntry{Name: ws.Name, Port: ws.SSHPort})
 	}
 	return ssh.UpdateSSHConfig(entries)
 }

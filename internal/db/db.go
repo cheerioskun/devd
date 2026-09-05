@@ -3,7 +3,11 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"os"
+	"path/filepath"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	_ "modernc.org/sqlite"
 
@@ -39,15 +43,45 @@ func Open() (*sql.DB, error) {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
 	db.SetMaxOpenConns(1)
+	if _, err := db.Exec("PRAGMA busy_timeout = 5000"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("configure database busy timeout: %w", err)
+	}
 	if _, err := db.Exec("PRAGMA foreign_keys = ON"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("enable foreign keys: %w", err)
 	}
-	if err := initializeSchema(db); err != nil {
+	unlock, err := LockMetadata()
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	err = initializeSchema(db)
+	unlock()
+	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("initialize schema: %w", err)
 	}
 	return db, nil
+}
+
+// LockMetadata serializes short cross-workspace changes: port allocation,
+// publication/removal, shared key creation, and managed SSH config refresh.
+// Acquire workspace locks first; never hold this lock while waiting for a VM.
+func LockMetadata() (func(), error) {
+	dir, err := config.DevdDir()
+	if err != nil {
+		return nil, err
+	}
+	file, err := os.OpenFile(filepath.Join(dir, "metadata.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return nil, fmt.Errorf("open metadata lock: %w", err)
+	}
+	if err := unix.Flock(int(file.Fd()), unix.LOCK_EX); err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("lock metadata: %w", err)
+	}
+	return func() { _ = file.Close() }, nil
 }
 
 const schemaVersion = 2
@@ -58,7 +92,7 @@ func initializeSchema(db *sql.DB) error {
 		return err
 	}
 	if version != 0 && version != schemaVersion {
-		return fmt.Errorf("database schema version %d is newer than supported version %d", version, schemaVersion)
+		return fmt.Errorf("database schema version %d is unsupported (expected %d)", version, schemaVersion)
 	}
 	if version != schemaVersion {
 		// ext4 disks are the only workspace backend. Pre-ext4 metadata is
@@ -126,9 +160,15 @@ func NextRelayPort(db *sql.DB) (int, error) {
 	return int(maxPort.Int64) + 1, nil
 }
 
-// CreateWorkspace inserts a new workspace record.
-func CreateWorkspace(db *sql.DB, ws *Workspace) error {
-	_, err := db.Exec(`
+// CreateWorkspace publishes a workspace and all its port declarations in one
+// transaction. Callers serialize port allocation with LockMetadata.
+func CreateWorkspace(db *sql.DB, ws *Workspace, ports ...int) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, err = tx.Exec(`
 		INSERT INTO workspaces (
 			name, image, image_digest, workspace_dir, disk_path, parent_name,
 			ssh_port, relay_port, cpus, memory, state, is_active, pid
@@ -137,7 +177,15 @@ func CreateWorkspace(db *sql.DB, ws *Workspace) error {
 		ws.Name, ws.Image, ws.ImageDigest, ws.WorkspaceDir, ws.DiskPath, ws.ParentName,
 		ws.SSHPort, ws.RelayPort, ws.CPUs, ws.Memory, ws.State, ws.IsActive, ws.PID,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	for _, port := range ports {
+		if _, err := tx.Exec("INSERT INTO reserved_ports (workspace, port) VALUES (?, ?)", ws.Name, port); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // WorkspaceExists reports whether a workspace name is already present.
@@ -152,8 +200,8 @@ func WorkspaceExists(db *sql.DB, name string) (bool, error) {
 // SetWorkspaceState updates the state and PID of a workspace.
 func SetWorkspaceState(db *sql.DB, name, state string, pid int) error {
 	_, err := db.Exec(
-		"UPDATE workspaces SET state = ?, pid = ? WHERE name = ?",
-		state, pid, name,
+		"UPDATE workspaces SET state = ?, pid = ?, is_active = CASE WHEN ? = 'stopped' THEN FALSE ELSE is_active END WHERE name = ?",
+		state, pid, state, name,
 	)
 	return err
 }
@@ -166,6 +214,13 @@ func SetActiveWorkspace(db *sql.DB, name string) error {
 	}
 	defer tx.Rollback()
 
+	var running bool
+	if err := tx.QueryRow("SELECT state = 'running' FROM workspaces WHERE name = ?", name).Scan(&running); err != nil {
+		return err
+	}
+	if !running {
+		return fmt.Errorf("workspace %q is not running", name)
+	}
 	if _, err := tx.Exec("UPDATE workspaces SET is_active = FALSE"); err != nil {
 		return err
 	}

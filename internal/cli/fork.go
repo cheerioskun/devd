@@ -1,8 +1,8 @@
 package cli
 
 import (
+	"database/sql"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -15,13 +15,11 @@ import (
 )
 
 var forkCmd = &cobra.Command{
-	Use:   "fork <source>",
-	Short: "Clone and start a stopped workspace",
+	Use: "fork <source>", Short: "Clone and start a stopped workspace",
 	Long: `Clone the complete disk state of a stopped workspace and start the new
 workspace. The host project mount is reused unless --mount or --no-mount is
 supplied.`,
-	Args: cobra.ExactArgs(1),
-	RunE: runFork,
+	Args: cobra.ExactArgs(1), RunE: runFork,
 }
 
 var (
@@ -50,245 +48,94 @@ func runFork(cmd *cobra.Command, args []string) error {
 	if forkNoMount && cmd.Flags().Changed("mount") {
 		return fmt.Errorf("--mount and --no-mount cannot be used together")
 	}
-	destinationName := forkName
+	name := forkName
 	var err error
-	if destinationName == "" {
-		destinationName, err = generatedWorkspaceName(args[0])
+	if name == "" {
+		name, err = generatedWorkspaceName(args[0])
 		if err != nil {
 			return err
 		}
-		fmt.Printf("INFO Generated workspace name %q\n", destinationName)
+		fmt.Printf("INFO Generated workspace name %q\n", name)
 	}
-
+	unlock, err := workspace.Lock(args[0], name)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	database, err := db.Open()
+	if err != nil {
+		return err
+	}
+	defer database.Close()
 	mount := forkMount
-	mountChanged := cmd.Flags().Changed("mount") || forkNoMount
 	if forkNoMount {
 		mount = ""
 	}
 	started := time.Now()
-	workspace, err := doFork(args[0], destinationName, forkOverrides{
-		CPUs:               forkCPUs,
-		CPUsChanged:        cmd.Flags().Changed("cpus"),
-		Memory:             forkMemory,
-		MemoryChanged:      cmd.Flags().Changed("memory"),
-		Ports:              forkPorts,
-		PortsChanged:       cmd.Flags().Changed("ports"),
-		Mount:              mount,
-		MountChanged:       mountChanged,
-		UserCommand:        forkUserCmd,
-		UserCommandChanged: cmd.Flags().Changed("cmd"),
-		KernelPath:         forkKernel,
-		KernelPathChanged:  cmd.Flags().Changed("kernel"),
+	ws, err := doFork(database, args[0], name, forkOverrides{
+		CPUs: forkCPUs, CPUsChanged: cmd.Flags().Changed("cpus"),
+		Memory: forkMemory, MemoryChanged: cmd.Flags().Changed("memory"),
+		Ports: forkPorts, PortsChanged: cmd.Flags().Changed("ports"),
+		Mount: mount, MountChanged: cmd.Flags().Changed("mount") || forkNoMount,
+		UserCommand: forkUserCmd, UserCommandChanged: cmd.Flags().Changed("cmd"),
+		KernelPath: forkKernel, KernelPathChanged: cmd.Flags().Changed("kernel"),
 	})
 	if err != nil {
 		return err
 	}
 	cloneElapsed := time.Since(started)
-
-	database, err := db.Open()
-	if err != nil {
-		return fmt.Errorf("open database: %w", err)
-	}
-	defer database.Close()
-	bootElapsed, err := startWorkspace(database, workspace)
+	bootElapsed, err := startWorkspace(database, ws)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("INFO Workspace %q forked from %q and ready\n", workspace.Name, args[0])
-	fmt.Printf("     SSH:    devd ssh %s\n", workspace.Name)
+	fmt.Printf("INFO Workspace %q forked from %q and ready\n", ws.Name, args[0])
+	fmt.Printf("     SSH:    devd ssh %s\n", ws.Name)
 	fmt.Printf("     Clone:  %s\n", cloneElapsed.Round(time.Millisecond))
 	fmt.Printf("     Boot:   %.2fs\n", bootElapsed.Seconds())
 	return nil
 }
 
-type forkOverrides struct {
-	CPUs               int
-	CPUsChanged        bool
-	Memory             int
-	MemoryChanged      bool
-	Ports              []int
-	PortsChanged       bool
-	Mount              string
-	MountChanged       bool
-	UserCommand        string
-	UserCommandChanged bool
-	KernelPath         string
-	KernelPathChanged  bool
-}
-
-// doFork creates a stopped destination record and disk. The fork command
-// starts it immediately after this function succeeds.
-func doFork(sourceName, destinationName string, overrides forkOverrides) (*db.Workspace, error) {
-	if err := config.ValidateWorkspaceName(sourceName); err != nil {
-		return nil, err
-	}
-	if err := config.ValidateWorkspaceName(destinationName); err != nil {
-		return nil, err
-	}
+// doFork resolves inheritance before invoking the shared publisher. The source
+// disk lock spans cloning; the command holds both workspace operation locks.
+func doFork(database *sql.DB, sourceName, destinationName string, overrides forkOverrides) (*db.Workspace, error) {
 	if sourceName == destinationName {
 		return nil, fmt.Errorf("fork destination must differ from source")
 	}
-	if err := vm.CheckRuntime(); err != nil {
+	if _, err := vm.RuntimePath(); err != nil {
 		return nil, err
 	}
-
-	database, err := db.Open()
+	source, err := loadWorkspace(database, sourceName)
 	if err != nil {
 		return nil, err
-	}
-	defer database.Close()
-	source, err := db.GetWorkspace(database, sourceName)
-	if err != nil {
-		return nil, err
-	}
-	if source.State == "running" && vm.IsRunning(source.PID) {
-		return nil, fmt.Errorf("workspace %q is running; stop it before forking", sourceName)
 	}
 	if source.State == "running" {
-		if err := db.SetWorkspaceState(database, sourceName, "stopped", 0); err != nil {
-			return nil, fmt.Errorf("reconcile source state: %w", err)
-		}
+		return nil, fmt.Errorf("workspace %q is running; stop it before forking", sourceName)
 	}
-	if source.DiskPath == "" {
-		return nil, fmt.Errorf("workspace %q has no ext4 disk path", sourceName)
-	}
-	if info, err := os.Stat(source.DiskPath); err != nil || !info.Mode().IsRegular() {
-		if err == nil {
-			err = fmt.Errorf("not a regular file")
-		}
-		return nil, fmt.Errorf("source disk %s: %w", source.DiskPath, err)
-	}
-	exists, err := db.WorkspaceExists(database, destinationName)
-	if err != nil {
-		return nil, fmt.Errorf("check destination name: %w", err)
-	}
-	if exists {
-		return nil, fmt.Errorf("workspace %q already exists", destinationName)
-	}
-
-	sourceSpec, err := workspace.Load(source.WorkspaceDir)
+	diskLock, err := storage.LockDisk(source.DiskPath)
 	if err != nil {
 		return nil, err
 	}
-	mountHost, mountGuest := sourceSpec.MountHost, sourceSpec.MountGuest
-	if overrides.MountChanged {
-		mountHost, mountGuest, err = parseMount(overrides.Mount)
-		if err != nil {
-			return nil, err
-		}
-	} else if mountHost != "" {
-		if info, statErr := os.Stat(mountHost); statErr != nil || !info.IsDir() {
-			if statErr == nil {
-				statErr = fmt.Errorf("not a directory")
-			}
-			return nil, fmt.Errorf("source host mount %s: %w (override with --mount)", mountHost, statErr)
-		}
-	}
-
-	cpus, memory := source.CPUs, source.Memory
-	if overrides.CPUsChanged {
-		cpus = overrides.CPUs
-	}
-	if overrides.MemoryChanged {
-		memory = overrides.Memory
-	}
-	if cpus <= 0 || cpus > 255 || memory <= 0 {
-		return nil, fmt.Errorf("fork CPU and memory overrides must be positive (cpus <= 255)")
-	}
-	userCommand := sourceSpec.UserCommand
-	if overrides.UserCommandChanged {
-		userCommand = overrides.UserCommand
-	}
-	kernelPath := sourceSpec.KernelPath
-	if overrides.KernelPathChanged {
-		kernelPath, err = resolveKernelPath(overrides.KernelPath)
-		if err != nil {
-			return nil, err
-		}
-	}
-	reservedPorts, err := db.GetReservedPorts(database, sourceName)
-	if err != nil {
-		return nil, fmt.Errorf("read source ports: %w", err)
-	}
-	if overrides.PortsChanged {
-		reservedPorts = overrides.Ports
-	}
-	if err := validatePorts(reservedPorts); err != nil {
-		return nil, err
-	}
-
-	sshPort, err := nextAvailableSSHPort(database)
-	if err != nil {
-		return nil, fmt.Errorf("allocate ssh port: %w", err)
-	}
-	relayPort, err := db.NextRelayPort(database)
-	if err != nil {
-		return nil, fmt.Errorf("allocate relay port: %w", err)
-	}
-	wsDir, err := config.WorkspaceDir(destinationName)
+	defer func() { _ = diskLock.Close() }()
+	spec, err := workspace.Load(source.WorkspaceDir)
 	if err != nil {
 		return nil, err
 	}
-	diskPath, err := config.WorkspaceDiskPath(destinationName)
+	ports, err := db.GetReservedPorts(database, sourceName)
 	if err != nil {
 		return nil, err
 	}
-	createdRecord := false
-	success := false
-	defer func() {
-		if success {
-			return
-		}
-		if createdRecord {
-			_ = db.DeleteWorkspace(database, destinationName)
-		}
-		_ = os.RemoveAll(wsDir)
-	}()
-
-	started := time.Now()
-	if err := storage.CloneDisk(source.DiskPath, diskPath); err != nil {
+	mount := ""
+	if spec.MountHost != "" {
+		mount = spec.MountHost + ":" + spec.MountGuest
+	}
+	plan := applyForkOverrides(workspacePlan{
+		Image: source.Image, ImageDigest: source.ImageDigest,
+		Spec: *spec, CPUs: source.CPUs, Memory: source.Memory, Ports: ports, Mount: mount,
+	}, overrides)
+	plan.ParentName = sourceName
+	plan, err = resolvePlan(plan)
+	if err != nil {
 		return nil, err
 	}
-	destinationSpec := *sourceSpec
-	destinationSpec.MountHost = mountHost
-	destinationSpec.MountGuest = mountGuest
-	destinationSpec.UserCommand = userCommand
-	destinationSpec.KernelPath = kernelPath
-	destinationSpec.ParentName = sourceName
-	if err := workspace.Save(wsDir, destinationSpec); err != nil {
-		return nil, err
-	}
-	if err := workspace.MarkRegenerateIdentity(wsDir); err != nil {
-		return nil, err
-	}
-
-	destination := &db.Workspace{
-		Name:         destinationName,
-		Image:        source.Image,
-		ImageDigest:  source.ImageDigest,
-		WorkspaceDir: wsDir,
-		DiskPath:     diskPath,
-		ParentName:   sourceName,
-		SSHPort:      sshPort,
-		RelayPort:    relayPort,
-		CPUs:         cpus,
-		Memory:       memory,
-		State:        "stopped",
-	}
-	if err := db.CreateWorkspace(database, destination); err != nil {
-		return nil, fmt.Errorf("record fork: %w", err)
-	}
-	createdRecord = true
-	for _, port := range reservedPorts {
-		if err := db.AddReservedPort(database, destinationName, port); err != nil {
-			return nil, fmt.Errorf("copy reserved port %d: %w", port, err)
-		}
-	}
-	if err := updateSSHConfig(database); err != nil {
-		fmt.Printf("WARN update ssh config: %v\n", err)
-	}
-
-	success = true
-	fmt.Printf("INFO Cloned workspace disk in %s\n", time.Since(started).Round(time.Millisecond))
-	return destination, nil
+	return publishWorkspace(database, destinationName, source.DiskPath, plan)
 }

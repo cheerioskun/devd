@@ -6,7 +6,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"devd/internal/db"
-	"devd/internal/vm"
+	"devd/internal/workspace"
 )
 
 var startCmd = &cobra.Command{
@@ -19,27 +19,21 @@ var startCmd = &cobra.Command{
 
 func runStart(cmd *cobra.Command, args []string) error {
 	name := args[0]
+	unlock, err := workspace.Lock(name)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	database, err := db.Open()
 	if err != nil {
 		return err
 	}
 	defer database.Close()
 
-	ws, err := db.GetWorkspace(database, name)
+	ws, err := loadWorkspace(database, name)
 	if err != nil {
 		return err
 	}
-	if ws.State == "running" && vm.IsRunning(ws.PID) {
-		return fmt.Errorf("workspace %q is already running (PID %d)", name, ws.PID)
-	}
-	if ws.State == "running" {
-		if err := db.SetWorkspaceState(database, name, "stopped", 0); err != nil {
-			return fmt.Errorf("reconcile stale workspace state: %w", err)
-		}
-		ws.State = "stopped"
-		ws.PID = 0
-	}
-
 	bootElapsed, err := startWorkspace(database, ws)
 	if err != nil {
 		return err

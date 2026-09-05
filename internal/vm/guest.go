@@ -8,7 +8,11 @@ import (
 
 const guestInitName = "devd-init"
 
-// WriteGuestInit writes the generic init used in every immutable ext4 image.
+// GuestBootstrap mounts the narrowly scoped control export and runs the current
+// host-supplied init. It deliberately bypasses bootstrap scripts in old disks.
+const GuestBootstrap = "mkdir -p /devd && mount -t virtiofs devd /devd && exec /bin/sh /devd/devd-init"
+
+// WriteGuestInit installs this version's guest policy in the control directory.
 func WriteGuestInit(dir string) (string, error) {
 	path := filepath.Join(dir, guestInitName)
 	if err := os.WriteFile(path, []byte(guestInitScript), 0755); err != nil {
@@ -26,9 +30,7 @@ SSH_PORT=${DEVD_SSH_PORT:?DEVD_SSH_PORT is required}
 ts() { date '+%H:%M:%S'; }
 echo "=== $LABEL boot [$(ts)] ==="
 
-mkdir -p /devd
-mount -t virtiofs devd /devd
-WS_DIR="/devd/workspaces/$LABEL"
+WS_DIR=/devd
 test -d "$WS_DIR"
 
 if [ -f "$WS_DIR/regenerate-identity" ]; then
@@ -49,9 +51,11 @@ hostname "$LABEL" 2>/dev/null || true
 chmod 755 /root
 mkdir -p /root/.ssh /run/sshd
 chmod 700 /root/.ssh
-cat /devd/ssh/devd_ed25519.pub >/root/.ssh/authorized_keys
+cat "$WS_DIR/authorized_keys" >/root/.ssh/authorized_keys
 chmod 600 /root/.ssh/authorized_keys
-echo 'root:devd' | chpasswd 2>/dev/null || true
+# Unlock the account for key login without installing a shared password.
+# Password and keyboard-interactive authentication are disabled below.
+passwd -d root >/dev/null 2>&1 || true
 
 if [ ! -s /etc/machine-id ] && [ -r /proc/sys/kernel/random/uuid ]; then
     tr -d '-' </proc/sys/kernel/random/uuid >/etc/machine-id
@@ -60,9 +64,11 @@ ssh-keygen -A >/dev/null 2>&1
 
 cat >/tmp/sshd_config <<SSHEOF
 Port $SSH_PORT
-PermitRootLogin yes
+PermitRootLogin prohibit-password
 PubkeyAuthentication yes
-PasswordAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
 PidFile /run/sshd-devd.pid
 HostKey /etc/ssh/ssh_host_rsa_key
 HostKey /etc/ssh/ssh_host_ecdsa_key

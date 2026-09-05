@@ -20,6 +20,7 @@ import (
 
 	"devd/internal/config"
 	"devd/internal/db"
+	"devd/internal/vm"
 )
 
 // Proxy owns declared host ports and forwards connections through OpenSSH
@@ -38,6 +39,7 @@ type Proxy struct {
 
 // Tunnel is one host Unix socket forwarded to a guest loopback port.
 type Tunnel struct {
+	key       string
 	Workspace string
 	Port      int
 	Path      string
@@ -106,6 +108,11 @@ func (p *Proxy) ensurePort(port int) error {
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	select {
+	case <-p.stopCh:
+		return fmt.Errorf("proxy stopped")
+	default:
+	}
 	if _, exists := p.listeners[port]; exists {
 		return nil
 	}
@@ -203,8 +210,28 @@ func (p *Proxy) targetForPort(port int) (*db.Workspace, error) {
 }
 
 func (p *Proxy) ensureTunnel(workspace *db.Workspace, port int) (*Tunnel, error) {
-	key := tunnelKey(workspace.Name, port)
+	process, err := vm.ReadProcess(filepath.Join(workspace.WorkspaceDir, "process.json"))
+	if err != nil {
+		return nil, err
+	}
+	if process == nil || process.PID != workspace.PID {
+		return nil, fmt.Errorf("workspace %q has no matching launch receipt", workspace.Name)
+	}
+	running, err := process.Running()
+	if err != nil {
+		return nil, fmt.Errorf("inspect workspace %q process: %w", workspace.Name, err)
+	}
+	if !running {
+		return nil, fmt.Errorf("workspace %q process has exited", workspace.Name)
+	}
+	key := fmt.Sprintf("%s:%d:%s:%d", workspace.Name, process.PID, process.StartTime, port)
 	p.mu.Lock()
+	select {
+	case <-p.stopCh:
+		p.mu.Unlock()
+		return nil, fmt.Errorf("proxy stopped")
+	default:
+	}
 	if tunnel := p.tunnels[key]; tunnel != nil {
 		p.mu.Unlock()
 		<-tunnel.Ready
@@ -217,6 +244,7 @@ func (p *Proxy) ensureTunnel(workspace *db.Workspace, port int) (*Tunnel, error)
 		return nil, err
 	}
 	tunnel := &Tunnel{
+		key:       key,
 		Workspace: workspace.Name,
 		Port:      port,
 		Path:      path,
@@ -263,11 +291,19 @@ func (p *Proxy) startTunnel(key string, tunnel *Tunnel, workspace *db.Workspace)
 		return
 	}
 
-	p.mu.Lock()
-	tunnel.Cmd = command
-	p.mu.Unlock()
 	wait := make(chan error, 1)
 	go func() { wait <- command.Wait() }()
+	p.mu.Lock()
+	// Reconciliation or Stop may have removed this pending tunnel while the
+	// subprocess was launching. Never publish a process after losing ownership.
+	if p.tunnels[key] != tunnel {
+		p.mu.Unlock()
+		_ = command.Process.Kill()
+		p.finishTunnelStart(key, tunnel, fmt.Errorf("tunnel start canceled"))
+		return
+	}
+	tunnel.Cmd = command
+	p.mu.Unlock()
 
 	ticker := time.NewTicker(20 * time.Millisecond)
 	defer ticker.Stop()
@@ -329,7 +365,7 @@ func (p *Proxy) finishTunnelStart(key string, tunnel *Tunnel, err error) {
 }
 
 func (p *Proxy) dropTunnel(tunnel *Tunnel) {
-	key := tunnelKey(tunnel.Workspace, tunnel.Port)
+	key := tunnel.key
 	p.mu.Lock()
 	if p.tunnels[key] == tunnel {
 		delete(p.tunnels, key)
@@ -350,10 +386,6 @@ func (p *Proxy) removeTunnel(key string, tunnel *Tunnel) {
 	_ = os.Remove(tunnel.Path)
 }
 
-func tunnelKey(workspace string, port int) string {
-	return workspace + ":" + strconv.Itoa(port)
-}
-
 func tunnelPath(key string) (string, error) {
 	devdDir, err := config.DevdDir()
 	if err != nil {
@@ -370,7 +402,17 @@ func tunnelPath(key string) (string, error) {
 		return "", fmt.Errorf("secure tunnel directory: %w", err)
 	}
 	digest := sha256.Sum256([]byte(devdDir + "\x00" + key))
-	return filepath.Join(dir, fmt.Sprintf("%x.sock", digest[:8])), nil
+	// Each tunnel incarnation owns a distinct path. Delayed cleanup of an old
+	// SSH process must never unlink the replacement tunnel's listening socket.
+	file, err := os.CreateTemp(dir, fmt.Sprintf("%x-*.sock", digest[:8]))
+	if err != nil {
+		return "", fmt.Errorf("allocate tunnel socket path: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(file.Name())
+		return "", err
+	}
+	return file.Name(), nil
 }
 
 // Stop releases all managed ports and SSH tunnels.
